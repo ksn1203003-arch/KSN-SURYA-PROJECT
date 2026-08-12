@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(New-Item -ItemType Directory -Force -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\supabase\\\\migrations\")",
+      "Bash(New-Item -ItemType File -Force -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\supabase\\\\migrations\\\\001_initial.sql\")",
+      "Bash(mkdir -p \"/mnt/c/Users/surya/Downloads/ClassroomAI/my-private-project1-main/supabase/migrations\")",
+      "Bash(touch \"/mnt/c/Users/surya/Downloads/ClassroomAI/my-private-project1-main/supabase/migrations/001_initial.sql\")",
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\supabase\\\\migrations\")",
+      "PowerShell(New-Item -ItemType File -Force -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\supabase\\\\migrations\\\\001_initial.sql\")",
+      "PowerShell(New-Item -ItemType File -Force -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\supabase\\\\seed.sql\")",
+      "Bash(node -e \"require\\('xlsx'\\); console.log\\('ok'\\)\")",
+      "Bash(npx vite *)",
+      "Bash(powershell -Command \"\\(\\(Get-Content 'c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\backend\\\\src\\\\routes\\\\teacher.ts'\\) | Measure-Object -Line\\).Lines\")",
+      "Bash(powershell -Command \"\\(\\(Get-Content 'c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\backend\\\\src\\\\routes\\\\school.ts'\\) | Measure-Object -Line\\).Lines\")",
+      "Bash(powershell -Command \"Get-Content 'c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\\\\backend\\\\src\\\\routes\\\\teacher.ts' | Select-Object -Last 5\")",
+      "Bash(npm run *)",
+      "WebSearch",
+      "WebFetch(domain:community.render.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:render.discourse.group)",
+      "WebFetch(domain:render.com)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\" -Recurse -Filter \"*.tsx\" -o File)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\" -Recurse -Directory)",
+      "Bash(Select-Object -First 30)",
+      "Bash(xargs grep -l \"attendance\\\\|Attendance\\\\|calendar\" -i)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\surya\\\\Downloads\\\\ClassroomAI\\\\my-private-project1-main\" -Recurse -Force | Where-Object { $_.PSIsContainer -eq $false } | Select-Object FullName | Sort-Object FullName)",
+      "PowerShell(curl -s http://localhost:4000/api/auth/me)",
+      "PowerShell(curl -s -o $null -w \"%{http_code}\" http://localhost:5173)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\surya\\OneDrive - Axiom365\\Documents\\ClassroomAI"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "TeachScript",
+  "short_name": "TeachScript",
+  "description": "AI-powered CS teaching platform for Indian schools (Classes 3–8)",
+  "theme_color": "#378ADD",
+  "background_color": "#F5F4F0",
+  "display": "standalone",
+  "start_url": "/",
+  "scope": "/",
+  "orientation": "portrait-primary",
+  "categories": ["education", "productivity"],
+  "lang": "en-IN",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Teacher Dashboard", "url": "/teacher/dashboard", "description": "Open teacher dashboard" },
+    { "name": "Student Dashboard", "url": "/student/dashboard", "description": "Open student dashboard" }
+  ]
+}

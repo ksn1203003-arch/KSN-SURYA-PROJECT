@@ -1,0 +1,209 @@
+version: "3.9"
+
+services:
+  # ── MongoDB (replica set — required for multi-document transactions) ──────────
+  # SECURITY: No "ports:" block — MongoDB is only reachable inside the Docker
+  # network (by service name "mongo"). It is NOT exposed to the host or internet.
+  # For local dev access (Compass, mongosh), use docker-compose.override.yml.
+  # AUTH: MONGO_INITDB_ROOT_USERNAME/PASSWORD must be set in your .env file or
+  # passed via docker-compose.override.yml. The backend MONGODB_URI must include
+  # credentials: mongodb://user:pass@mongo:27017/teachscript?authSource=admin&replicaSet=rs0
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--auth"]
+    expose:
+      - "27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-tsadmin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:?MONGO_INITDB_ROOT_PASSWORD must be set}
+      - MONGO_INITDB_DATABASE=teachscript
+    volumes:
+      - mongo_data:/data/db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok",
+             "--username", "${MONGO_INITDB_ROOT_USERNAME:-tsadmin}",
+             "--password", "${MONGO_INITDB_ROOT_PASSWORD}",
+             "--authenticationDatabase", "admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # One-shot init container: runs rs.initiate() once after Mongo is healthy
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      mongosh --host mongo:27017
+      --username ${MONGO_INITDB_ROOT_USERNAME:-tsadmin}
+      --password ${MONGO_INITDB_ROOT_PASSWORD}
+      --authenticationDatabase admin
+      --quiet --eval
+      "try { rs.status().ok } catch(e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}) }"
+
+  # ── MongoDB Backup (daily dump → /backups volume + optional S3 sync) ─────────
+  # Runs mongodump daily at 02:00 IST. Retains last 7 days locally.
+  # Set BACKUP_S3_BUCKET=s3://your-bucket/teachscript-backups and ensure the host
+  # IAM role or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars are set to
+  # enable automatic offsite upload after each dump.
+  # Uses the mongo:7 image (has mongodump) + installs awscli for S3 upload.
+  mongo-backup:
+    image: mongo:7
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    volumes:
+      - mongo_backups:/backups
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-tsadmin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-south-1}
+    entrypoint: >
+      sh -c "
+        if [ -n \"$$BACKUP_S3_BUCKET\" ] && ! command -v aws > /dev/null 2>&1; then
+          apt-get update -qq && apt-get install -y -qq awscli > /dev/null 2>&1;
+        fi;
+        while true; do
+          sleep_secs=$$(( (68400 - ($$(date -u +%s) % 86400) + 86400) % 86400 ));
+          sleep $$sleep_secs;
+          STAMP=$$(date +%Y%m%d_%H%M%S);
+          mongodump --host mongo:27017
+            --username $$MONGO_INITDB_ROOT_USERNAME
+            --password $$MONGO_INITDB_ROOT_PASSWORD
+            --authenticationDatabase admin
+            --db teachscript
+            --gzip
+            --archive=/backups/teachscript_$$STAMP.gz;
+          find /backups -name '*.gz' -mtime +7 -delete;
+          echo \"[backup] Done: teachscript_$$STAMP.gz\";
+          if [ -n \"$$BACKUP_S3_BUCKET\" ] && command -v aws > /dev/null 2>&1; then
+            aws s3 cp /backups/teachscript_$$STAMP.gz $$BACKUP_S3_BUCKET/teachscript_$$STAMP.gz \
+              && echo \"[backup] Uploaded to S3: $$BACKUP_S3_BUCKET\" \
+              || echo \"[backup] S3 upload failed — local copy retained\";
+          fi;
+        done"
+
+  # ── Redis (auth cache + BullMQ queues) ───────────────────────────────────────
+  # SECURITY: No "ports:" block — Redis is only reachable inside the Docker network.
+  # AOF persistence: --appendonly yes ensures queue jobs survive Redis restarts.
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend (Express API) ─────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    env_file:
+      - ./backend/.env
+    environment:
+      # Override individual vars — credentials injected from host environment
+      - MONGODB_URI=mongodb://${MONGO_INITDB_ROOT_USERNAME:-tsadmin}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/teachscript?authSource=admin&replicaSet=rs0
+      - REDIS_URL=redis://redis:6379
+      - NODE_ENV=production
+      # Ensure all new Date() calls and date formatting inside the container use IST.
+      # Without this, cloud hosts default to UTC and any code that calls new Date()
+      # without explicit timeZone will produce UTC dates — 5h30m off from IST.
+      - TZ=Asia/Kolkata
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health/detailed"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Frontend (Nginx + Vite build) ─────────────────────────────────────────────
+  # VITE_BACKEND_URL must be set in your deployment environment or .env file.
+  # It is the public URL browsers use to reach the backend API.
+  # Example: VITE_BACKEND_URL=https://api.yourdomain.com
+  # The default (http://localhost:4000) is only correct for local development.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_BACKEND_URL=${VITE_BACKEND_URL:-http://localhost:4000}
+    expose:
+      - "80"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Nginx reverse proxy (TLS termination + routing) ──────────────────────────
+  # Terminates TLS and routes:
+  #   /api/* → backend:4000
+  #   /*      → frontend:80
+  # TLS certificates: place fullchain.pem + privkey.pem in ./nginx/certs/
+  # (e.g. from Let's Encrypt certbot). The container falls back to HTTP-only
+  # if no certs directory is mounted, so development works without certs.
+  # Production: set DOMAIN env var (e.g. DOMAIN=app.teachscript.in)
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mongo_data:
+  mongo_backups:
+  redis_data:
