@@ -14,6 +14,7 @@ export interface UserProfile {
   phone: string | null
   username: string | null
   role: "student" | "teacher" | "admin" | "super_admin" | "parent"
+  gender: "male" | "female" | null
   school_id: string | null
   class_id: string | null
   profile_photo_url: string | null

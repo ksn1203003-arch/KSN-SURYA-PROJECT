@@ -12,8 +12,18 @@ import {
   type ChildProfile, type ChildClass, type ChildTeacher, type ChildAttendance,
   type ModuleProgress, type ChildExamResult, type ChildCertificate,
 } from "@/lib/parentApi"
+import { attendanceBasisLabel, formatCountedDate, istTodayYmd } from "@/lib/attendanceBasis"
 
 type View = "overview" | "progress" | "marks" | "attendance" | "certificates"
+
+// English wording of the Attendance screen, kept in one place so Hindi can be added later.
+// The "counted from" caption itself comes from lib/attendanceBasis.ts.
+const ATTENDANCE_TEXT = {
+  rateUnavailable: "N/A",
+  noRecords:       "No attendance records found.",
+  notCountedYet:   "Not counted yet",
+  noSheetsSince:   (date: string) => `No attendance recorded since ${date}`,
+} as const
 
 const NAV_ITEMS: Array<{ label: string; icon: LucideIcon; view: View }> = [
   { label: "Overview",      icon: User,          view: "overview" },
@@ -93,6 +103,34 @@ export function ParentDashboard() {
 
   const child = profile?.child
   const cls   = profile?.class
+
+  // Attendance screen values, worked out here so the JSX only shows them. A missing rate (nothing
+  // counted yet) is shown neutral "N/A" — never coloured as a low figure. The rate is shown as sent
+  // (one decimal). The caption comes only from the server's counted_from / counted_class_label.
+  const attendanceRate     = attendance?.rate ?? null
+  const attendanceCountedFrom = attendance?.counted_from ?? null
+  const attendanceBasisText = attendance
+    ? attendanceBasisLabel({
+        countedFrom: attendanceCountedFrom,
+        className:   attendance.counted_class_label ?? null,
+        todayYmd:    istTodayYmd(),
+      })
+    : ""
+  const attendanceEmptyText = attendanceCountedFrom === null
+    ? ATTENDANCE_TEXT.noRecords
+    : attendanceCountedFrom > istTodayYmd()
+      ? ATTENDANCE_TEXT.notCountedYet
+      : ATTENDANCE_TEXT.noSheetsSince(formatCountedDate(attendanceCountedFrom))
+  const attendanceStats = [
+    {
+      label: "Attendance Rate",
+      value: attendanceRate === null ? ATTENDANCE_TEXT.rateUnavailable : `${attendanceRate}%`,
+      color: attendanceRate === null ? "text-muted-foreground" : attendanceRate >= 75 ? "text-green-600" : "text-orange-500",
+    },
+    { label: "Present", value: attendance?.present ?? 0, color: "text-green-600" },
+    { label: "Late",    value: attendance?.late ?? 0,    color: "text-orange-500" },
+    { label: "Absent",  value: attendance?.absent ?? 0,  color: "text-red-500" },
+  ]
 
   return (
     <DashboardLayout
@@ -236,12 +274,7 @@ export function ParentDashboard() {
           ) : (
             <>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                {[
-                  { label: "Attendance Rate", value: attendance?.rate !== null ? `${attendance?.rate}%` : "N/A", color: (attendance?.rate ?? 0) >= 75 ? "text-green-600" : "text-orange-500" },
-                  { label: "Present", value: attendance?.present ?? 0, color: "text-green-600" },
-                  { label: "Late",    value: attendance?.late ?? 0,    color: "text-orange-500" },
-                  { label: "Absent",  value: attendance?.absent ?? 0,  color: "text-red-500" },
-                ].map(stat => (
+                {attendanceStats.map(stat => (
                   <Card key={stat.label}>
                     <CardContent className="pt-4 text-center">
                       <p className={`text-2xl font-bold ${stat.color}`}>{stat.value}</p>
@@ -250,8 +283,11 @@ export function ParentDashboard() {
                   </Card>
                 ))}
               </div>
+              {attendanceBasisText && (
+                <p className="text-xs text-muted-foreground">{attendanceBasisText}</p>
+              )}
               {(attendance?.records.length ?? 0) === 0 && (
-                <p className="text-muted-foreground text-center py-12">No attendance records found.</p>
+                <p className="text-muted-foreground text-center py-12">{attendanceEmptyText}</p>
               )}
             </>
           )}
@@ -268,17 +304,30 @@ export function ParentDashboard() {
             <p className="text-muted-foreground text-center py-12">No certificates earned yet.</p>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {certificates.map(cert => (
-                <Card key={cert._id}>
-                  <CardContent className="pt-4 flex items-center gap-3">
-                    <Award className="w-8 h-8 text-yellow-500 flex-shrink-0" />
-                    <div>
-                      <p className="font-semibold text-sm">{cert.module_title}</p>
-                      <p className="text-xs text-muted-foreground">{cert.subject} · {new Date(cert.issued_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</p>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
+              {certificates.map(cert => {
+                const revoked = cert.status === "revoked"
+                const title = cert.type === "custom" ? (cert.custom_title || cert.module_title) : cert.module_title
+                return (
+                  <Card key={cert._id} className={revoked ? "border-dashed" : undefined}>
+                    <CardContent className="pt-4 flex items-center gap-3">
+                      <Award className={`w-8 h-8 flex-shrink-0 ${revoked ? "text-muted-foreground" : "text-yellow-500"}`} />
+                      <div className="min-w-0">
+                        <p className={`font-semibold text-sm ${revoked ? "line-through decoration-muted-foreground/60" : ""}`}>{title}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {cert.subject ? `${cert.subject} · ` : ""}{new Date(cert.issued_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
+                        </p>
+                        {revoked && (
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            <span className="font-semibold uppercase tracking-wide text-[10px]">Revoked</span>
+                            {cert.revoked_at ? ` on ${new Date(cert.revoked_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}` : ""}
+                            {cert.revoke_reason ? ` — ${cert.revoke_reason}` : ""}
+                          </p>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                )
+              })}
             </div>
           )}
         </div>

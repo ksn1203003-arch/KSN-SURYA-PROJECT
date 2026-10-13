@@ -121,8 +121,12 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    ports:
-      - "4000:4000"
+    # SECURITY: no published port. Only nginx (same Docker network) talks to the API.
+    # A published port would let anyone skip nginx and send a made-up X-Forwarded-For,
+    # which "trust proxy 1" would believe — giving every request a fresh rate-limit key.
+    # For local access use docker-compose.override.yml (localhost only).
+    expose:
+      - "4000"
     env_file:
       - ./backend/.env
     environment:

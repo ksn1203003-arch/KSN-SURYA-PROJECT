@@ -22,6 +22,14 @@ export interface ICertificate extends Document {
   cert_template:   "course_completion" | "academic_excellence" | "outstanding_achievement" | null
   pdf_gridfs_id?:  mongoose.Types.ObjectId | null
   module_deleted:  boolean
+  // Who issued it (teacher/admin). null for certificates claimed by students before
+  // teacher-issued certificates replaced self-claim.
+  issued_by:       mongoose.Types.ObjectId | null
+  // Revoked certificates are kept (never deleted) so the school can show what happened.
+  status:          "active" | "revoked"
+  revoked_at:      Date | null
+  revoked_by:      mongoose.Types.ObjectId | null
+  revoke_reason:   string
 }
 
 const schema = new mongoose.Schema<ICertificate>({
@@ -40,6 +48,11 @@ const schema = new mongoose.Schema<ICertificate>({
   cert_template:  { type: String, enum: ["course_completion", "academic_excellence", "outstanding_achievement", null], default: null },
   pdf_gridfs_id:  { type: mongoose.Schema.Types.ObjectId, default: null },
   module_deleted: { type: Boolean, default: false },
+  issued_by:      { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  status:         { type: String, enum: ["active", "revoked"], default: "active" },
+  revoked_at:     { type: Date, default: null },
+  revoked_by:     { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  revoke_reason:  { type: String, default: "", maxlength: 300 },
 })
 
 schema.index({ school_id: 1 })

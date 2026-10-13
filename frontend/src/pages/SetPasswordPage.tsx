@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label"
 import { CheckCircle2, Eye, EyeOff } from "lucide-react"
 import { resetPassword, changePassword } from "@/lib/auth"
 import { useAuth } from "@/contexts/AuthContext"
+import { dashboardPathForRole, getSafeRedirectPath } from "@/lib/dashboardRoutes"
 import zxcvbn from "zxcvbn"
 
 type PageState = "form" | "done" | "invalid"
@@ -60,12 +61,11 @@ export function SetPasswordPage() {
       if (changeError) { setError(changeError); return }
       await refreshUser()
       setPageState("done")
-      const role = user?.role
-      setTimeout(() => {
-        if (role === "admin" || role === "super_admin") navigate("/admin/dashboard")
-        else if (role === "teacher") navigate("/teacher/dashboard")
-        else navigate("/student/dashboard")
-      }, 2000)
+      const role = user?.role ?? "student"
+      // Return to the page the user was trying to open before the forced password change, if it is
+      // a dashboard path their role may open; otherwise their own dashboard.
+      const destination = getSafeRedirectPath(searchParams.get("redirect"), role) ?? dashboardPathForRole(role)
+      setTimeout(() => navigate(destination), 2000)
       return
     }
 

@@ -12,18 +12,6 @@ import { CircleCheck as CheckCircle2, BookOpen, MessageSquare, Award, Mic, Chart
 
 const BENEFITS = [
   {
-    icon: <Mic className="w-5 h-5" />,
-    gradient: "var(--gradient-stat-blue)",
-    title: "Whisper script",
-    desc: "A teacher-facing script shows you exactly what to say each slide. Zero prep time. Zero CS knowledge needed.",
-  },
-  {
-    icon: <BookOpen className="w-5 h-5" />,
-    gradient: "var(--gradient-stat-green)",
-    title: "Lesson plans ready",
-    desc: "210 fully planned lessons across Class 3–8. Just open and teach. No lesson planning on weekends.",
-  },
-  {
     icon: <BarChart2 className="w-5 h-5" />,
     gradient: "var(--gradient-stat-purple)",
     title: "Automatic reports",
@@ -39,7 +27,7 @@ const BENEFITS = [
     icon: <MessageSquare className="w-5 h-5" />,
     gradient: "var(--gradient-stat-red)",
     title: "AI assistant",
-    desc: "Ask the built-in AI assistant anything about the lesson, curriculum, or student difficulty. Answer in seconds.",
+    desc: "Ask the built-in AI assistant anything about any lesson, curriculum, or student difficulty. Answer in seconds.",
   },
   {
     icon: <Zap className="w-5 h-5" />,
@@ -47,29 +35,41 @@ const BENEFITS = [
     title: "Works offline",
     desc: "Download lessons to teach from unreliable internet. Everything syncs when you're back online.",
   },
+  {
+    icon: <Mic className="w-5 h-5" />,
+    gradient: "var(--gradient-stat-blue)",
+    title: "Whisper script (CS curriculum)",
+    desc: "If you're assigned the CS curriculum, a teacher-facing script shows you exactly what to say each slide. Zero CS knowledge needed.",
+  },
+  {
+    icon: <BookOpen className="w-5 h-5" />,
+    gradient: "var(--gradient-stat-green)",
+    title: "210 ready CS lessons",
+    desc: "A fully planned Computer Science curriculum across Class 3–8, ready whenever your school needs it. Just open and teach.",
+  },
 ]
 
-const TESTIMONIALS = [
+const WHY_TEACHERS_CHOOSE_US = [
   {
-    quote: "I had never taught CS in my life. By lesson 3 I was explaining algorithms without looking at the script. It builds your confidence.",
-    name: "Priya Sharma",
-    school: "DPS Noida",
-    initials: "PS",
-    subject: "Class Teacher, Gr. 6",
+    quote: "No CS background needed — the whisper script tells you exactly what to say, lesson by lesson, so you can teach with confidence from day one.",
+    name: "No experience required",
+    school: "Whisper script included",
+    initials: "✓",
+    subject: "For any class teacher",
   },
   {
-    quote: "The quiz system saves me 2 hours every week. I used to manually check notebooks. Now it's all automatic.",
-    name: "Ravi Kumar",
-    school: "KV Chennai",
-    initials: "RK",
-    subject: "Computer Teacher",
+    quote: "Quizzes are graded automatically the moment a student submits — no more manually checking notebooks one by one.",
+    name: "Hours back every week",
+    school: "Auto-graded quizzes",
+    initials: "✓",
+    subject: "Instant results",
   },
   {
-    quote: "My students look forward to CS class now. The Byte mascot and the AI labs make it feel different from other subjects.",
-    name: "Meena Iyer",
-    school: "Springdales Delhi",
-    initials: "MI",
-    subject: "Science & CS, Gr. 7",
+    quote: "Points, streaks, and certificates make progress visible to students — turning coursework into something they want to keep coming back to.",
+    name: "Built-in motivation",
+    school: "Points & certificates",
+    initials: "✓",
+    subject: "For every grade",
   },
 ]
 
@@ -109,13 +109,13 @@ export function ForTeachersPage() {
             <span className="text-xs font-medium text-ts-red">Made for teachers</span>
           </div>
           <h1 className="text-3xl md:text-4xl font-medium text-foreground leading-snug mb-4">
-            Teach CS with confidence —
+            Less admin, more teaching —
             <br className="hidden md:block" />
-            <span className="gradient-text-blue-green"> even if you don't know CS</span>
+            <span className="gradient-text-blue-green"> whatever class you teach</span>
           </h1>
           <p className="text-sm text-muted-foreground max-w-xl mx-auto leading-relaxed mb-6">
-            TeachScript was built for exactly the teacher who says "I'm not technical". Our whisper script, ready
-            lessons, and AI assistant make you the best CS teacher in your school.
+            Attendance, marks, homework, and certificates are tracked automatically, so you spend less time on paperwork.
+            And if you're assigned the CS curriculum, our whisper script and AI assistant mean "I'm not technical" is never a problem.
           </p>
           <div className="flex flex-wrap items-center justify-center gap-3">
             <Button
@@ -139,7 +139,7 @@ export function ForTeachersPage() {
       {/* A day in the life — gradient icon cards */}
       <section className="py-16 px-4">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-2xl font-medium text-foreground text-center mb-10">A CS teaching day with TeachScript</h2>
+          <h2 className="text-2xl font-medium text-foreground text-center mb-10">A teaching day with TeachScript</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-5">
             {DAY_IN_LIFE.map((item, i) => (
               <div key={item.time} className="glass-card rounded-[14px] p-5 text-center relative overflow-hidden hover:scale-[1.02] transition-transform animate-fade-in-up" style={{ animationDelay: `${i * 0.1}s` }}>
@@ -178,9 +178,9 @@ export function ForTeachersPage() {
       {/* Testimonials — glass cards */}
       <section className="py-16 px-4">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-2xl font-medium text-foreground text-center mb-10">From teachers like you</h2>
+          <h2 className="text-2xl font-medium text-foreground text-center mb-10">Why teachers choose us</h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-            {TESTIMONIALS.map((t, i) => (
+            {WHY_TEACHERS_CHOOSE_US.map((t, i) => (
               <div key={t.name} className="glass-card rounded-[14px] p-5 relative overflow-hidden animate-fade-in-up" style={{ animationDelay: `${i * 0.1}s` }}>
                 <div className="absolute top-0 left-0 right-0 h-0.5" style={{ background: i === 0 ? "var(--gradient-stat-blue)" : i === 1 ? "var(--gradient-stat-green)" : "var(--gradient-stat-amber)" }} />
                 <p className="text-sm text-foreground leading-relaxed mb-4">"{t.quote}"</p>
@@ -234,9 +234,9 @@ export function ForTeachersPage() {
       {/* CTA — gradient button */}
       <section className="py-16 px-4">
         <div className="max-w-lg mx-auto text-center">
-          <h2 className="text-2xl font-medium text-foreground mb-3">Ready to be a great CS teacher?</h2>
+          <h2 className="text-2xl font-medium text-foreground mb-3">Ready to spend less time on paperwork?</h2>
           <p className="text-sm text-muted-foreground mb-6">
-            Ask your school to sign up. It's free for 14 days, no credit card. You'll be teaching CS confidently from day one.
+            Ask your school to sign up. It's free for 14 days, no credit card. You'll be up and running from day one.
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
             <Button

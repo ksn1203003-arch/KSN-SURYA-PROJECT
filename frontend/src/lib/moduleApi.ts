@@ -46,6 +46,8 @@ export interface ModuleItem {
   // file
   gridfs_id: string | null
   pdf_gridfs_id: string | null  // pre-converted PDF for PPTX/PPT inline viewing
+  // PPT/PPTX only: converted once at upload. null on items uploaded before this field existed.
+  conversion_status?: "pending" | "ready" | "failed" | null
   file_name: string | null
   file_type: string | null
   file_size: number | null
@@ -171,6 +173,10 @@ export async function markItemViewed(moduleId: string, itemId: string): Promise<
   return authFetch<{ success: boolean } | { error: string }>(`/api/modules/${moduleId}/items/${itemId}/viewed`, { method: "POST" })
 }
 
+export async function unmarkItemViewed(moduleId: string, itemId: string): Promise<{ success: boolean } | { error: string }> {
+  return authFetch<{ success: boolean } | { error: string }>(`/api/modules/${moduleId}/items/${itemId}/viewed`, { method: "DELETE" })
+}
+
 // Fetch a backend file as a blob URL.
 // 1. Calls /api/files/token to get a short-lived one-time token (auth via cookie).
 // 2. Fetches the file with ?ft= so the JWT never appears in a URL.
@@ -201,6 +207,26 @@ export async function fetchAsBlobUrl(url: string): Promise<string> {
   if (!res.ok) throw new Error(`File fetch failed: ${res.status}`)
   const blob = await res.blob()
   return URL.createObjectURL(blob)
+}
+
+// Lesson videos play in parts: the <video> player asks for one piece at a time using a
+// short reusable link, so a whole video is never downloaded before it starts and seeking
+// works. Every other file (PDF, slides, images, documents) keeps the one-time whole download.
+const STREAMED_VIDEO_TYPES = new Set(["mp4", "webm"])
+
+export function isStreamedVideo(item: ModuleItem): boolean {
+  return item.type === "file" && !!item.gridfs_id && STREAMED_VIDEO_TYPES.has((item.file_type ?? "").toLowerCase())
+}
+
+/** Address for playing a lesson video in parts. Throws when the video cannot be prepared. */
+export async function getVideoStreamUrl(item: ModuleItem): Promise<string> {
+  if (!isStreamedVideo(item) || !item.gridfs_id) throw new Error("Not a lesson video")
+  const res = await authFetch<{ streamToken: string } | { error: string }>("/api/files/stream-token", {
+    method: "POST",
+    body: JSON.stringify({ gridfsId: item.gridfs_id }),
+  })
+  if ("error" in res) throw new Error(res.error)
+  return `${BACKEND}/api/files/${item.gridfs_id}?st=${encodeURIComponent(res.streamToken)}`
 }
 
 // Returns the backend URL for a file item (no auth token — use with fetchAsBlobUrl)
@@ -249,10 +275,19 @@ export function youtubeEmbedUrl(url: string): string {
 }
 
 // PPTX/PPT without a converted PDF (LibreOffice not available) — show download card
-export function needsDownloadFallback(item: ModuleItem): boolean {
-  return item.type === "file" &&
-    (item.file_type === "pptx" || item.file_type === "ppt") &&
-    !item.pdf_gridfs_id
+export type SlideConversionState = "converting" | "ready" | "failed"
+
+/**
+ * Viewing state of a PPT/PPTX item, or null for any other item. "converting" means the
+ * one-time conversion is still running — the screen shows a status and a manual
+ * "Check again" button; it never polls the server. Older items with no PDF and no status
+ * were never converted, so they are treated as "failed" (the teacher re-uploads them).
+ */
+export function slideConversionState(item: ModuleItem): SlideConversionState | null {
+  if (item.type !== "file" || (item.file_type !== "pptx" && item.file_type !== "ppt")) return null
+  if (item.pdf_gridfs_id) return "ready"
+  if (item.conversion_status === "pending") return "converting"
+  return "failed"
 }
 
 export function formatFileSize(bytes: number): string {
@@ -261,18 +296,5 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export function fileIcon(fileType: string | null): string {
-  if (!fileType) return "📄"
-  if (fileType === "pdf") return "📕"
-  if (fileType === "pptx" || fileType === "ppt") return "📊"
-  if (fileType === "docx" || fileType === "doc") return "📝"
-  if (fileType === "mp4" || fileType === "webm") return "🎬"
-  if (["jpg","jpeg","png","webp","gif"].includes(fileType)) return "🖼️"
-  return "📄"
-}
-
-export function linkIcon(linkType: LinkType | null): string {
-  if (linkType === "gdrive") return "📁"
-  if (linkType === "youtube") return "▶️"
-  return "🔗"
-}
+// Icon-mapping JSX for these moved to components/LessonItemTypeIcon.tsx
+// (LessonFileTypeIcon / LessonLinkTypeIcon) — this file is API/data logic only.

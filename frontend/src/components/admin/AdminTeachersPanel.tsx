@@ -12,7 +12,7 @@ import {
 import {
   Modal, Spinner, SectionHeader, Empty, CopyBtn,
   downloadTeacherCredential, downloadBulkTeacherCredentials,
-  MultiSelectDropdown,
+  MultiSelectDropdown, ListPager, usePagedRows,
 } from "./adminComponents"
 import { clsLabel } from "./adminShared"
 import type {
@@ -20,6 +20,7 @@ import type {
   AttPeriod, TeacherAttDetail,
 } from "./adminTypes"
 import { parseTeacherFile } from "@/lib/userApi"
+import { UserPhoto } from "@/components/UserPhoto"
 
 interface AdminTeachersPanelProps {
   teachers: TeacherRow[]
@@ -98,6 +99,11 @@ export default function AdminTeachersPanel({
   editAssignments, setEditAssignments, editTeacherErr, editTeacherLoading, handleEditTeacher,
   confirmRemove, setConfirmRemove, handleRemove, removeLoading,
 }: AdminTeachersPanelProps) {
+  const teacherPager = usePagedRows(filteredTeachers, searchTeachers)
+  const pageIds = teacherPager.pageRows.map(t => t.id)
+  const pageAllSelected = pageIds.length > 0 && pageIds.every(id => selectedTeacherIds.has(id))
+  const selectedCount = filteredTeachers.filter(t => selectedTeacherIds.has(t.id)).length
+  const selectedOffPage = selectedCount - pageIds.filter(id => selectedTeacherIds.has(id)).length
   const csvTeacherRef = useRef<HTMLInputElement>(null)
 
   return (
@@ -126,9 +132,11 @@ export default function AdminTeachersPanel({
       </div>
 
       {/* Teacher bulk actions bar */}
-      {selectedTeacherIds.size > 0 && (
+      {selectedCount > 0 && (
         <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg border border-border bg-muted/60 flex-wrap">
-          <span className="text-xs font-semibold text-foreground mr-1">{selectedTeacherIds.size} selected</span>
+          <span className="text-xs font-semibold text-foreground mr-1">
+            {selectedCount} selected{selectedOffPage > 0 ? ` (${selectedOffPage} on other pages)` : ""}
+          </span>
           <button onClick={() => setShowTeacherBulkActions(s => !s)}
             className="text-xs text-ts-green font-medium hover:underline">{showTeacherBulkActions ? "Hide actions" : "Show actions"}</button>
           {showTeacherBulkActions && (
@@ -146,9 +154,12 @@ export default function AdminTeachersPanel({
                 </Button>
               </div>
               <Button size="sm" disabled={teacherBulkActionLoading}
-                onClick={() => { if (confirm(`Delete ${selectedTeacherIds.size} teacher(s)? This cannot be undone.`)) handleTeacherBulkAction("delete") }}
+                onClick={() => {
+                  const offPage = selectedOffPage > 0 ? `, including ${selectedOffPage} not on this page` : ""
+                  if (confirm(`Delete ${selectedCount} teacher(s)${offPage}? This cannot be undone.`)) handleTeacherBulkAction("delete")
+                }}
                 className="h-7 text-xs rounded-md px-2 bg-red-500 hover:bg-red-600 text-white ml-auto">
-                {teacherBulkActionLoading ? "…" : `Delete ${selectedTeacherIds.size}`}
+                {teacherBulkActionLoading ? "…" : `Delete ${selectedCount}`}
               </Button>
             </>
           )}
@@ -189,7 +200,17 @@ export default function AdminTeachersPanel({
           </Button>}
         />
       ) : (
-        <div className="skillio-card rounded-xl overflow-x-auto">
+        <>
+        {pageAllSelected && selectedCount < filteredTeachers.length && (
+          <p role="status" className="mb-3 px-3 py-2 rounded-lg bg-muted/60 text-xs text-foreground">
+            All {pageIds.length} teachers on this page are selected.{" "}
+            <button className="font-semibold text-ts-blue hover:underline"
+              onClick={() => setSelectedTeacherIds(() => new Set(filteredTeachers.map(t => t.id)))}>
+              Select all {filteredTeachers.length} matching teachers
+            </button>
+          </p>
+        )}
+        <div id="teachers-table" tabIndex={-1} aria-label="Teachers list" className="skillio-card rounded-xl overflow-x-auto scroll-mt-4 focus:outline-none">
           <table className="w-full text-sm border-collapse">
             <colgroup>
               <col style={{ width: "40px" }} />
@@ -203,12 +224,13 @@ export default function AdminTeachersPanel({
             <thead>
               <tr style={{ background: "var(--muted)" }}>
                 <th className="px-4 py-3">
-                  <input type="checkbox"
-                    checked={filteredTeachers.length > 0 && filteredTeachers.every(t => selectedTeacherIds.has(t.id))}
-                    onChange={e => {
-                      if (e.target.checked) setSelectedTeacherIds(() => new Set(filteredTeachers.map(t => t.id)))
-                      else setSelectedTeacherIds(() => new Set())
-                    }}
+                  <input type="checkbox" aria-label="Select all teachers on this page"
+                    checked={pageAllSelected}
+                    onChange={e => setSelectedTeacherIds(prev => {
+                      const next = new Set(prev)
+                      pageIds.forEach(id => { if (e.target.checked) next.add(id); else next.delete(id) })
+                      return next
+                    })}
                     className="w-3.5 h-3.5 rounded cursor-pointer accent-green-600"
                   />
                 </th>
@@ -221,7 +243,7 @@ export default function AdminTeachersPanel({
               </tr>
             </thead>
             <tbody>
-              {filteredTeachers.map(t => {
+              {teacherPager.pageRows.map(t => {
                 const checked = selectedTeacherIds.has(t.id)
                 const isExpanded = expandedTeacherId === t.id
                 const detail = teacherDetailMap[t.id]
@@ -232,7 +254,7 @@ export default function AdminTeachersPanel({
                     <tr key={t.id} onClick={() => setSelectedTeacherIds(prev => { const next = new Set(prev); checked ? next.delete(t.id) : next.add(t.id); return next })}
                       className={`border-t border-border transition-colors cursor-pointer select-none ${checked ? "bg-green-50/60 dark:bg-green-900/10" : isExpanded ? "bg-muted/40" : "hover:bg-muted/30"}`}>
                       <td className="px-4 py-3.5" onClick={e => e.stopPropagation()}>
-                        <input type="checkbox" checked={checked}
+                        <input type="checkbox" checked={checked} aria-label={`Select ${t.name}`}
                           onChange={e => setSelectedTeacherIds(prev => {
                             const next = new Set(prev)
                             e.target.checked ? next.add(t.id) : next.delete(t.id)
@@ -243,15 +265,14 @@ export default function AdminTeachersPanel({
                       </td>
                       <td className="px-4 py-3.5">
                         <div className="flex items-center gap-2.5">
-                          {t.profile_photo_url ? (
-                            <img src={t.profile_photo_url} alt={t.name}
-                              className="w-8 h-8 rounded-full object-cover shrink-0 border border-border" />
-                          ) : (
-                            <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
-                              style={{ background: "linear-gradient(135deg,#639922,#10b981)" }}>
-                              {t.name.split(" ").map((w: string) => w[0]).join("").slice(0, 2).toUpperCase()}
-                            </div>
-                          )}
+                          <UserPhoto path={t.photo_url}
+                            className="w-8 h-8 rounded-full object-cover shrink-0 border border-border"
+                            fallback={
+                              <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                                style={{ background: "linear-gradient(135deg,#639922,#10b981)" }}>
+                                {t.name.split(" ").map((w: string) => w[0]).join("").slice(0, 2).toUpperCase()}
+                              </div>
+                            } />
                           <div className="min-w-0">
                             <p className="font-semibold text-foreground text-sm truncate">{t.name}</p>
                             <div className="flex items-center gap-2 mt-0.5">
@@ -494,6 +515,8 @@ export default function AdminTeachersPanel({
             </tbody>
           </table>
         </div>
+        <ListPager {...teacherPager} noun="teachers" anchorId="teachers-table" />
+        </>
       )}
 
       {/* Invite teacher modal */}

@@ -6,7 +6,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { useState, useEffect, useRef, useMemo, type ChangeEvent } from "react"
 import { TimeInput12h, TIME_OPTIONS, to12h, parseTyped } from "@/components/shared/TimeInput12h"
-import * as XLSX from "xlsx"
 import { TimetableDisplayView } from "@/components/TimetableDisplayView"
 import { DashboardLayout } from "@/components/DashboardLayout"
 import { createPortal } from "react-dom"
@@ -15,7 +14,7 @@ import {
   ChevronLeft, ChevronRight, Send, Copy, Check, X, Plus, Upload, Trash2, Search,
   Loader2, Code, TrendingUp, ChevronDown, Clock, FlaskConical, Globe2, Music2,
   Palette, Dumbbell, BookMarked, Cpu, Leaf, Landmark, Languages, Microscope, Sigma, Drama,
-  Atom, Map, Link2, GripVertical, Pencil, ExternalLink, ChevronUp, Download, FileSpreadsheet, RotateCcw, Eye
+  Atom, Map, Link2, GripVertical, Pencil, ExternalLink, ChevronUp, Download, FileSpreadsheet, RotateCcw, Eye, Ban
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -25,18 +24,22 @@ import { getMyClass, addStudent, bulkAddStudents, removeUser, parseStudentCSV, u
 import {
   getModules, createModule, renameModule, deleteModule, getModuleDeleteImpact, reorderModules,
   uploadFiles, addLink, renameItem, deleteItem, reorderItems,
-  getViewerUrl, driveEmbedUrl, fetchAsBlobUrl, getModuleCounts, formatFileSize, fileIcon, linkIcon, needsDownloadFallback,
+  getViewerUrl, driveEmbedUrl, fetchAsBlobUrl, getModuleCounts, formatFileSize, slideConversionState, isStreamedVideo,
   type LessonModule, type ModuleItem,
 } from "@/lib/moduleApi"
-import { getActiveChallenges, createChallenge, deleteChallenge, getChallengeSubmissions, type CodeChallenge, getMyQuizzes, getMyQuizzesForClass, createQuiz, deleteQuiz, getQuizResults, updateQuizDeadline, type Quiz, getCertTemplate, saveCertTemplate, uploadCertLogo, removeCertLogo, getCertsByClass, downloadCertPDF, viewCertPDF, previewCertPDF, bulkDownloadCerts, issueCertificates, revokeCustomCert, deleteCert, type CertTemplate, type StudentCertificate } from "@/lib/studentApi"
+import { createChallenge, deleteChallenge, type CodeChallenge, getMyQuizzes, getMyQuizzesForClass, createQuiz, deleteQuiz, getQuizResults, updateQuizDeadline, type Quiz, getCertTemplate, saveCertTemplate, uploadCertLogo, removeCertLogo, getCertsByClass, downloadCertPDF, viewCertPDF, previewCertPDF, bulkDownloadCerts, issueCertificates, revokeCert, isRevoked, type CertTemplate, type StudentCertificate } from "@/lib/studentApi"
 import { DatePicker } from "@/components/ui/date-picker"
 import { requestDataDeletion } from "@/lib/dpdpApi"
 import { SkeletonList } from "@/components/SkeletonCard"
+import { LessonFileTypeIcon, LessonLinkTypeIcon } from "@/components/LessonItemTypeIcon"
 import { TeacherHomeworkPanel } from "@/components/teacher/TeacherHomeworkPanel"
 import { TeacherMarksPanel } from "@/components/teacher/TeacherMarksPanel"
 import { TeacherAttendancePanel } from "@/components/teacher/TeacherAttendancePanel"
 import { TeacherQuizzesPanel } from "@/components/teacher/TeacherQuizzesPanel"
 import { TeacherLiveCodingPanel } from "@/components/teacher/TeacherLiveCodingPanel"
+import { CertificateCompletionPanel } from "@/components/teacher/CertificateCompletionPanel"
+import { useUserPhoto } from "@/lib/userPhoto"
+import { LessonVideo } from "@/components/LessonVideo"
 
 // ── Static data ────────────────────────────────────────────────────────────────
 
@@ -119,11 +122,10 @@ const LESSONS: Array<{ id: number; period: number; title: string; chapter: strin
 
 
 // ── Student avatar — DB photo > localStorage > gradient initials ──
-function StudentAvatar({ name, size = 28, atRisk = false, photoUrl }: { name: string; size?: number; atRisk?: boolean; photoUrl?: string | null }) {
-  const photo = photoUrl ?? (() => {
-    try { return localStorage.getItem(`teachscript_avatar_${name.replace(/\s+/g, "_")}`) }
-    catch { return null }
-  })()
+function StudentAvatar({ name, size = 28, atRisk = false, photoPath }: { name: string; size?: number; atRisk?: boolean; photoPath?: string | null }) {
+  // Only the server photo: a picture saved on this device under a name could belong to a
+  // different student with the same name on a shared school computer
+  const photo = useUserPhoto(photoPath)
   const initials = name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()
   return (
     <div
@@ -134,8 +136,8 @@ function StudentAvatar({ name, size = 28, atRisk = false, photoUrl }: { name: st
       }}
     >
       {photo
-        ? <img src={photo} alt={name} className="w-full h-full object-cover" />
-        : <span className="text-white font-bold" style={{ fontSize: size * 0.36 }}>{initials}</span>
+        ? <img src={photo} alt="" className="w-full h-full object-cover" />
+        : <span aria-hidden="true" className="text-white font-bold" style={{ fontSize: size * 0.36 }}>{initials}</span>
       }
     </div>
   )
@@ -278,30 +280,7 @@ function TeacherTimetableView({
     const pt: Record<number, { start: string; end: string }> = {}
     for (const s of slots) { if (!pt[s.period]) pt[s.period] = { start: s.start_time, end: s.end_time } }
     setTtPeriodTimes(pt)
-    // auto-fill sample if class has no timetable yet
-    if (slots.length === 0) {
-      const TIMES: Record<number, { start: string; end: string }> = {
-        1: { start: "08:00", end: "08:40" }, 2: { start: "08:40", end: "09:20" },
-        3: { start: "09:30", end: "10:10" }, 4: { start: "10:10", end: "10:50" },
-        5: { start: "11:10", end: "11:50" }, 6: { start: "11:50", end: "12:30" },
-        7: { start: "13:05", end: "13:45" }, 8: { start: "13:45", end: "14:25" },
-      }
-      const SCHED: Record<string, Record<number, string>> = {
-        Monday:    { 1:"CT & AI", 2:"Maths",   3:"English", 4:"Science", 5:"Hindi",   6:"CT & AI", 7:"Maths",   8:"English" },
-        Tuesday:   { 1:"Maths",   2:"CT & AI", 3:"Science", 4:"English", 5:"CT & AI", 6:"Hindi",   7:"Science", 8:"Maths"   },
-        Wednesday: { 1:"English", 2:"Science", 3:"CT & AI", 4:"Maths",   5:"English", 6:"CT & AI", 7:"Hindi",   8:"Science" },
-        Thursday:  { 1:"Science", 2:"English", 3:"Maths",   4:"CT & AI", 5:"Science", 6:"Maths",   7:"CT & AI", 8:"Hindi"   },
-        Friday:    { 1:"Hindi",   2:"Maths",   3:"CT & AI", 4:"Science", 5:"Maths",   6:"English", 7:"Science", 8:"CT & AI" },
-        Saturday:  { 1:"CT & AI", 2:"English", 3:"Hindi",   4:"Maths",   5:"CT & AI", 6:"Science", 7:"English", 8:"Maths"   },
-      }
-      const filled: typeof slots = []
-      TT_DAYS.forEach(day => TT_PERIODS.forEach(period => {
-        const subject = SCHED[day]?.[period] ?? ""
-        if (subject) filled.push({ day, period, subject, teacher_id: null, teacher_name: null, start_time: TIMES[period].start, end_time: TIMES[period].end })
-      }))
-      setTtSlots(filled)
-      setTtPeriodTimes(TIMES)
-    }
+    // A class with no timetable stays empty — the teacher can choose "Use sample timetable" while editing
   }
 
   function getSlot(day: string, period: number) { return ttSlots.find(s => s.day === day && s.period === period) }
@@ -366,7 +345,7 @@ function TeacherTimetableView({
       TT_PERIODS.forEach(period => {
         const subject = SCHED[day]?.[period] ?? ""
         if (subject) {
-          slots.push({ day, period, subject, teacher_id: null, start_time: TIMES[period].start, end_time: TIMES[period].end })
+          slots.push({ day, period, subject, teacher_id: null, teacher_name: null, start_time: TIMES[period].start, end_time: TIMES[period].end })
         }
       })
     })
@@ -447,9 +426,12 @@ function TeacherTimetableView({
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                       Edit mode — change subjects then save
                     </span>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap justify-end">
                       {ttMsg && <span className={`text-xs font-medium ${ttMsg.startsWith("Error") ? "text-red-500" : "text-green-600"}`}>{ttMsg}</span>}
-                      <Button variant="outline" onClick={() => { setEditMode(false); setTtMsg("") }} className="h-7 text-xs rounded-lg px-3">Cancel</Button>
+                      {ttSlots.length === 0 && (
+                        <Button variant="outline" onClick={fillSampleTimetable} className="h-7 text-xs rounded-lg px-3" title="Fills an example you can edit. Nothing is saved until you click Save Changes.">Use sample timetable</Button>
+                      )}
+                      <Button variant="outline" onClick={() => { handleClassChange(ttClassId); setTtMsg("") }} className="h-7 text-xs rounded-lg px-3">Cancel</Button>
                       <Button onClick={handleSave} disabled={ttSaving} className="h-7 text-xs rounded-lg px-3" style={{ background: "#534AB7", color: "white" }}>
                         {ttSaving ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Saving…</> : "Save Changes"}
                       </Button>
@@ -537,7 +519,7 @@ const QUICK_ACTIONS = [
   "Generate 5 more quiz questions on algorithms",
 ]
 
-interface DbStudent { id: string; name: string; email: string; username: string | null; class_id: string | null; is_active: boolean; profile_photo_url?: string | null }
+interface DbStudent { id: string; name: string; email: string; username: string | null; class_id: string | null; is_active: boolean; photo_url?: string | null }
 interface BulkResult { name: string; username: string; temp_password: string; error?: string }
 
 // ── Working Hours Bar Component ────────────────────────────────────────────────
@@ -683,7 +665,6 @@ export function TeacherDashboard() {
 
   // ── new feature state ────────────────────────────────────────────────────────
   const [problemStatements, setProblemStatements] = useState<CodeChallenge[]>([])
-  const [problemsLoading, setProblemsLoading] = useState(true)
 
   // Grouped by title — same challenge pushed to multiple classes = one card
   const groupedChallenges = useMemo(() => {
@@ -716,7 +697,7 @@ export function TeacherDashboard() {
 
   // ── certificate state ─────────────────────────────────────────────────────
   const [certClassId,    setCertClassId]    = useState<string>("")
-  const [certModules,    setCertModules]    = useState<Array<{ module_id: string; module_title: string; subject: string; total_items: number; certificates: StudentCertificate[] }>>([])
+  const [certModules,    setCertModules]    = useState<Array<{ module_id: string | null; module_title: string; subject: string; total_items: number; certificates: StudentCertificate[] }>>([])
   const [certCustomCerts, setCertCustomCerts] = useState<StudentCertificate[]>([])
   const [certRemovedModules, setCertRemovedModules] = useState<Array<{ module_title: string; subject: string; certificates: StudentCertificate[] }>>([])
   const [certShowEmpty, setCertShowEmpty] = useState(false)
@@ -739,7 +720,9 @@ export function TeacherDashboard() {
   const [certIssueError, setCertIssueError] = useState("")
   const [certClassStudents, setCertClassStudents] = useState<Array<{ id: string; name: string }>>([])
   const [certSelectedIds, setCertSelectedIds] = useState<Set<string>>(new Set())
-  const [certRevoking,       setCertRevoking]       = useState<string | null>(null)
+  const [certRevokeReason,   setCertRevokeReason]   = useState("")
+  const [certRevokeCount,    setCertRevokeCount]    = useState(0)
+  const [certActionError,    setCertActionError]    = useState("")
   const [certDeleteConfirm, setCertDeleteConfirm]   = useState<{ certId: string; studentName: string; moduleTitle: string } | null>(null)
   const [certModuleDeleting, setCertModuleDeleting] = useState<string | null>(null)
   const [certBulkIds,        setCertBulkIds]        = useState<Set<string>>(new Set())
@@ -792,6 +775,10 @@ export function TeacherDashboard() {
   const [viewerItem, setViewerItem] = useState<ModuleItem | null>(null)
   const [viewerBlobUrl, setViewerBlobUrl] = useState<string | null>(null)
   const [viewerBlobLoading, setViewerBlobLoading] = useState(false)
+  // Bumped by the viewer's "Try again" button to load the same file again
+  const [viewerRetry, setViewerRetry] = useState(0)
+  // True only after the file really failed to load (drives the "Try again" message)
+  const [viewerFailed, setViewerFailed] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const linkExcelRef = useRef<HTMLInputElement>(null)
   const dragSrcRef = useRef<{ moduleId: string; idx: number } | null>(null)
@@ -850,9 +837,6 @@ export function TeacherDashboard() {
   const [ttUpdatedAt, setTtUpdatedAt] = useState<string | null>(null)
 
   // ── submission tracking ──────────────────────────────────────────────────────
-  interface Submission { student_name: string; code: string; language: string; submitted_at: string }
-  const [submissionsMap,     setSubmissionsMap]     = useState<Record<string, Submission[]>>({})
-  const [submissionsLoading, setSubmissionsLoading] = useState<Record<string, boolean>>({})
   const [expandedSubs,       setExpandedSubs]       = useState<Set<string>>(new Set())
   const [expandedCode,       setExpandedCode]       = useState<{ challengeId: string; idx: number } | null>(null)
 
@@ -886,16 +870,6 @@ export function TeacherDashboard() {
     setProblemClassIds(allIds)
   }, [showProblemModal])
 
-  // Load real challenges from backend
-  useEffect(() => {
-    setProblemsLoading(true)
-    getActiveChallenges().then(res => {
-      setProblemsLoading(false)
-      if ("error" in res) return
-      setProblemStatements(res.challenges)
-    })
-  }, [user?.id])
-
   // Load quizzes for selected class
   useEffect(() => {
     if (!quizClassId) return
@@ -907,29 +881,20 @@ export function TeacherDashboard() {
     })
   }, [quizClassId])
 
-  const loadAllSubmissions = (challenges: CodeChallenge[]) => {
-    if (challenges.length === 0) return
-    const loadingState: Record<string, boolean> = {}
-    challenges.forEach(c => { loadingState[c._id] = true })
-    setSubmissionsLoading(prev => ({ ...prev, ...loadingState }))
-    challenges.forEach(c => {
-      getChallengeSubmissions(c._id).then(res => {
-        setSubmissionsLoading(prev => ({ ...prev, [c._id]: false }))
-        if ("error" in res) return
-        setSubmissionsMap(prev => ({ ...prev, [c._id]: res.submissions }))
-      })
+  // Sent-notification history: loaded once when the Notifications section is first opened.
+  // (Previously this ran inside rendering, so every re-render before the answer arrived sent another request.)
+  const notifHistoryRequestedRef = useRef(false)
+  useEffect(() => {
+    if (view !== "notifications" || tNotifHistoryLoaded || notifHistoryRequestedRef.current) return
+    notifHistoryRequestedRef.current = true
+    getTeacherSentNotifications().then(res => {
+      setTNotifHistoryLoaded(true)
+      if (!("error" in res)) setTNotifHistory(res.notifications)
     })
-  }
+  }, [view, tNotifHistoryLoaded])
 
+  // Challenges and their submissions are loaded by the Live Code panel itself, only when it is opened
   useEffect(() => {
-    if (problemStatements.length === 0) return
-    loadAllSubmissions(problemStatements)
-  }, [problemStatements])
-
-  useEffect(() => {
-    if (view === "problem-statements" && problemStatements.length > 0) {
-      loadAllSubmissions(problemStatements)
-    }
     // Ensure ttClasses is loaded when quizzes/certs view opens (for class picker)
     if ((view === "quizzes" || view === "certificates") && ttClasses.length === 0) {
       getTeacherClasses().then(res => {
@@ -982,12 +947,22 @@ export function TeacherDashboard() {
     })
   }
 
-  // Reload when offset changes
-  useEffect(() => { refreshWeekActivity(weekOffset) }, [weekOffset, user?.id])
-
-  // Load today's upcoming classes from the real timetable
+  // Working hours are shown only on the Dashboard: load when it is open, again when the
+  // week changes, and at most every 2 minutes for the same week
+  const weekLoadedRef = useRef<{ offset: number; at: number } | null>(null)
   useEffect(() => {
-    if (!user?.id) return
+    if (!user?.id || view !== "dashboard") return
+    const last = weekLoadedRef.current
+    if (last && last.offset === weekOffset && Date.now() - last.at < 2 * 60_000) return
+    weekLoadedRef.current = { offset: weekOffset, at: Date.now() }
+    refreshWeekActivity(weekOffset)
+  }, [weekOffset, user?.id, view])
+
+  // Load today's upcoming classes from the real timetable — Dashboard only, once per visit to the page
+  const upcomingLoadedRef = useRef(false)
+  useEffect(() => {
+    if (!user?.id || view !== "dashboard" || upcomingLoadedRef.current) return
+    upcomingLoadedRef.current = true
     setUpcomingClassesLoading(true)
     getTeacherClasses().then(res => {
       setUpcomingClassesLoading(false)
@@ -1016,10 +991,15 @@ export function TeacherDashboard() {
       upcoming.sort((a, b) => toMins(a.start_time) - toMins(b.start_time))
       setUpcomingClasses(upcoming.slice(0, 4))
     })
-  }, [user?.id])
+  }, [user?.id, view])
 
-  // Load teacher's assigned class + students from backend
+  // Load the teacher's own class, its students and their course progress — needed by the
+  // Dashboard (average progress) and the Students section. Loaded once; the Students
+  // section's add/remove actions refresh it explicitly.
+  const myClassLoadedRef = useRef(false)
   useEffect(() => {
+    if (!user?.id || (view !== "dashboard" && view !== "students") || myClassLoadedRef.current) return
+    myClassLoadedRef.current = true
     async function load() {
       setLoadingStudents(true)
       const res = await getMyClass()
@@ -1042,7 +1022,7 @@ export function TeacherDashboard() {
       setLoadingStudents(false)
     }
     load()
-  }, [user?.id])
+  }, [user?.id, view])
 
   const loadStudents = async () => {
     setLoadingStudents(true)
@@ -1054,7 +1034,6 @@ export function TeacherDashboard() {
     setLoadingStudents(false)
   }
 
-  useEffect(() => { if (view === "students") loadStudents() }, [view, schoolId, teacherClassId])
 
 
   // Sync teacher settings form from user object
@@ -1097,6 +1076,35 @@ export function TeacherDashboard() {
     }
   }, [view, ttClasses])
 
+  // "Check again" on a slide deck that is still converting: re-read this subject's lessons once
+  // (no polling), keep the viewer open, and switch it to the PDF if the conversion has finished.
+  const [slideChecking, setSlideChecking] = useState(false)
+  async function recheckSlideConversion(item: ModuleItem) {
+    if (!lessonSubject || !lessonClassId) return
+    setSlideChecking(true)
+    const res = await getModules(lessonClassId, lessonSubject)
+    setSlideChecking(false)
+    if ("error" in res) return
+    setModules(res.modules)
+    const fresh = res.modules.flatMap(m => m.items).find(i => i._id === item._id)
+    if (fresh) setViewerItem(fresh)
+  }
+
+  // Teachers may download any lesson file — used when a slide deck could not be converted
+  async function downloadOriginalLessonFile(item: ModuleItem) {
+    try {
+      const url = await fetchAsBlobUrl(getViewerUrl(item))
+      const a = document.createElement("a")
+      a.href = url
+      a.download = item.file_name ?? item.label
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    } catch {
+      setViewerDownloadError("Could not download the file. Please try again.")
+    }
+  }
+  const [viewerDownloadError, setViewerDownloadError] = useState("")
+
   // Load modules when a subject is selected
   useEffect(() => {
     if (!lessonSubject || !lessonClassId) return
@@ -1120,25 +1128,32 @@ export function TeacherDashboard() {
     getModuleCounts(lessonClassId).then(counts => setSubjectModuleCounts(counts))
   }, [lessonClassId])
 
-  // All file items are loaded as blob URLs — removes auth tokens from URLs entirely
+  // Files load as blob URLs (no auth token in a URL); videos get a short reusable
+  // stream link so they play in parts instead of downloading whole first
   useEffect(() => {
     if (!viewerItem) {
       if (viewerBlobUrl) { URL.revokeObjectURL(viewerBlobUrl); setViewerBlobUrl(null) }
       return
     }
     if (viewerItem.type !== "file") { setViewerBlobUrl(null); return }
+    // Lesson videos are played in parts by <LessonVideo>, which gets its own stream link
+    if (isStreamedVideo(viewerItem)) { setViewerBlobUrl(null); setViewerBlobLoading(false); return }
+    // A slide deck that is still converting (or failed) has nothing to preview — don't download it
+    const slideState = slideConversionState(viewerItem)
+    if (slideState && slideState !== "ready") { setViewerBlobUrl(null); setViewerBlobLoading(false); return }
 
     let cancelled = false
     let created: string | null = null
     setViewerBlobLoading(true)
+    setViewerFailed(false)
     setViewerBlobUrl(null)
     fetchAsBlobUrl(getViewerUrl(viewerItem)).then(url => {
       if (cancelled) { URL.revokeObjectURL(url); return }
       created = url
       setViewerBlobUrl(url)
-    }).catch(() => {}).finally(() => { if (!cancelled) setViewerBlobLoading(false) })
+    }).catch(() => { if (!cancelled) setViewerFailed(true) }).finally(() => { if (!cancelled) setViewerBlobLoading(false) })
     return () => { cancelled = true; if (created) URL.revokeObjectURL(created) }
-  }, [viewerItem])
+  }, [viewerItem, viewerRetry])
 
   // Load students + existing records when class+period are selected
   useEffect(() => {
@@ -1499,15 +1514,19 @@ export function TeacherDashboard() {
     setCertTemplate(t => ({ ...t, logo_gridfs_id: null, logo_base64: null, logo_mime: null }))
     setCertLogoRemoving(false)
   }
-  async function handleBulkDownload(moduleId: string) {
+  async function handleBulkDownload(target: { moduleId: string } | { subject: string }) {
     if (!certClassId) return
-    setCertBulkLoading(moduleId)
-    bulkDownloadCerts(certClassId, moduleId)
-    setTimeout(() => setCertBulkLoading(null), 5000)
+    const key = "moduleId" in target ? target.moduleId : `subject:${target.subject}`
+    setCertBulkLoading(key)
+    setCertActionError("")
+    const err = await bulkDownloadCerts(certClassId, target)
+    setCertBulkLoading(null)
+    if (err) setCertActionError(err)
   }
 
   async function handleIssueCerts() {
     if (!certClassId || certSelectedIds.size === 0 || !certIssueTitle.trim()) return
+    if (!certIssueTemplate) { setCertIssueError("Please choose a certificate type."); return }
     setCertIssueLoading(true)
     setCertIssueError("")
     const res = await issueCertificates({
@@ -1515,7 +1534,7 @@ export function TeacherDashboard() {
       student_ids:   Array.from(certSelectedIds),
       custom_title:  certIssueTitle.trim(),
       custom_reason: certIssueReason.trim() || undefined,
-      cert_template: certIssueTemplate ?? undefined,
+      cert_template: certIssueTemplate,
     })
     setCertIssueLoading(false)
     if ("error" in res) { setCertIssueError(res.error); return }
@@ -1527,42 +1546,44 @@ export function TeacherDashboard() {
     setCertSelectedIds(new Set())
   }
 
-  async function handleRevokeCert(certId: string) {
-    if (!confirm("Revoke this custom certificate? This cannot be undone.")) return
-    setCertRevoking(certId)
-    const res = await revokeCustomCert(certId)
-    setCertRevoking(null)
-    if (!("error" in res)) {
-      setCertCustomCerts(prev => prev.filter(c => c._id !== certId))
-    }
+  // A revoked certificate stays in every list, shown as "Revoked" (it is never deleted)
+  function markCertsRevoked(ids: Set<string>, reason: string) {
+    if (ids.size > 0) setCertRevokeCount(n => n + 1)
+    const revokedAt = new Date().toISOString()
+    const mark = (c: StudentCertificate): StudentCertificate =>
+      ids.has(c._id) ? { ...c, status: "revoked", revoked_at: revokedAt, revoke_reason: reason } : c
+    setCertModules(prev => prev.map(mod => ({ ...mod, certificates: mod.certificates.map(mark) })))
+    setCertCustomCerts(prev => prev.map(mark))
+    setCertRemovedModules(prev => prev.map(g => ({ ...g, certificates: g.certificates.map(mark) })))
   }
 
-  async function handleBulkDeleteCerts() {
+  async function handleBulkRevokeCerts() {
     if (certBulkIds.size === 0) return
     setCertBulkDeleting(true)
+    setCertActionError("")
+    const reason = certRevokeReason.trim()
     const ids = Array.from(certBulkIds)
-    const results = await Promise.allSettled(ids.map(id => revokeCustomCert(id)))
-    const deletedIds = new Set(
-      ids.filter((_, i) => results[i].status === "fulfilled" && !("error" in (results[i] as PromiseFulfilledResult<{ success: boolean } | { error: string }>).value))
-    )
-    setCertCustomCerts(prev => prev.filter(c => !deletedIds.has(c._id)))
+    const results = await Promise.all(ids.map(id => revokeCert(id, reason)))
+    const revoked = new Set(ids.filter((_, i) => !("error" in results[i])))
+    markCertsRevoked(revoked, reason)
+    if (revoked.size < ids.length) setCertActionError(`${ids.length - revoked.size} certificate(s) could not be revoked. Please try again.`)
     setCertBulkIds(new Set())
     setCertBulkDeleting(false)
     setCertBulkConfirm(false)
+    setCertRevokeReason("")
   }
 
-  async function handleDeleteModuleCert() {
+  async function handleConfirmRevoke() {
     if (!certDeleteConfirm) return
-    setCertModuleDeleting(certDeleteConfirm.certId)
-    const res = await deleteCert(certDeleteConfirm.certId)
+    const { certId } = certDeleteConfirm
+    const reason = certRevokeReason.trim()
+    setCertModuleDeleting(certId)
+    const res = await revokeCert(certId, reason)
     setCertModuleDeleting(null)
+    if ("error" in res) { setCertActionError(res.error); return }
     setCertDeleteConfirm(null)
-    if (!("error" in res)) {
-      setCertModules(prev => prev.map(mod => ({
-        ...mod,
-        certificates: mod.certificates.filter(c => c._id !== certDeleteConfirm.certId),
-      })))
-    }
+    setCertRevokeReason("")
+    markCertsRevoked(new Set([certId]), reason)
   }
   async function openDeleteModuleConfirm(id: string, title: string) {
     setModuleDeleteConfirm({ id, title, certificateCount: null })
@@ -1584,7 +1605,10 @@ export function TeacherDashboard() {
     setModuleDeleteConfirm(null)
   }
 
+  // Only the most recent class request may update the screen (fast class switching)
+  const certClassRequestRef = useRef(0)
   function loadCertClass(classId: string) {
+    const requestNo = ++certClassRequestRef.current
     setCertClassId(classId)
     setCertModulesLoading(true)
     setCertCustomCerts([])
@@ -1597,8 +1621,10 @@ export function TeacherDashboard() {
       getCertsByClass(classId),
       getClassStudents(classId),
     ]).then(([certsRes, studentsRes]) => {
+      if (requestNo !== certClassRequestRef.current) return
       setCertModulesLoading(false)
-      if (!("error" in certsRes)) {
+      if ("error" in certsRes) { setCertModules([]); setCertCustomCerts([]); setCertActionError(certsRes.error) }
+      else {
         setCertModules(certsRes.modules)
         setCertCustomCerts(certsRes.custom_certificates ?? [])
         setCertRemovedModules(certsRes.removed_modules ?? [])
@@ -1853,7 +1879,7 @@ export function TeacherDashboard() {
                 <div className="flex flex-col gap-3 flex-1">
                   {students.slice(0, 4).map((st) => (
                     <div key={st.id} className="flex items-center gap-2.5">
-                      <StudentAvatar name={st.name} size={32} photoUrl={st.profile_photo_url} />
+                      <StudentAvatar name={st.name} size={32} photoPath={st.photo_url} />
                       <div className="flex-1 min-w-0">
                         <span className="text-xs font-semibold text-foreground truncate block">{st.name}</span>
                         <span className="text-[10px] text-muted-foreground">{st.username ?? "—"}</span>
@@ -1950,7 +1976,7 @@ export function TeacherDashboard() {
                           <tr key={st.id} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20 transition-colors">
                             <td className="px-5 py-3">
                               <div className="flex items-center gap-2.5">
-                                <StudentAvatar name={st.name} size={30} photoUrl={st.profile_photo_url} />
+                                <StudentAvatar name={st.name} size={30} photoPath={st.photo_url} />
                                 <p className="text-xs font-semibold text-foreground">{st.name}</p>
                               </div>
                             </td>
@@ -2308,7 +2334,11 @@ export function TeacherDashboard() {
                               </span>
 
                               {/* Type icon */}
-                              <span className="text-sm shrink-0 leading-none">{item.type === "file" ? fileIcon(item.file_type) : linkIcon(item.link_type)}</span>
+                              <span className="shrink-0 text-muted-foreground">
+                                {item.type === "file"
+                                  ? <LessonFileTypeIcon fileType={item.file_type} className="w-3.5 h-3.5" />
+                                  : <LessonLinkTypeIcon linkType={item.link_type} className="w-3.5 h-3.5" />}
+                              </span>
 
                               {renamingItemKey === `${mod._id}::${item._id}` ? (
                                 <form className="flex items-center gap-2 flex-1 min-w-0" onSubmit={e => { e.preventDefault(); handleRenameItem(mod._id, item._id) }}>
@@ -2326,7 +2356,11 @@ export function TeacherDashboard() {
                                   >
                                     <p className="text-xs font-medium text-foreground truncate group-hover/item:text-ts-purple transition-colors leading-tight">{item.label}</p>
                                     {item.type === "file" && item.file_size && (
-                                      <p className="text-[10px] text-muted-foreground leading-tight mt-0.5">{item.file_type?.toUpperCase()} · {formatFileSize(item.file_size)}</p>
+                                      <p className="text-[10px] text-muted-foreground leading-tight mt-0.5">
+                                        {item.file_type?.toUpperCase()} · {formatFileSize(item.file_size)}
+                                        {slideConversionState(item) === "converting" && <span className="ml-1.5 font-semibold text-amber-600 dark:text-amber-400">· Getting slides ready for students…</span>}
+                                        {slideConversionState(item) === "failed" && <span className="ml-1.5 font-semibold text-destructive">· Not viewable by students — please re-upload</span>}
+                                      </p>
                                     )}
                                     {item.type === "link" && item.link_url && (
                                       <p className="text-[10px] text-muted-foreground truncate leading-tight mt-0.5 max-w-[220px]">{item.link_url}</p>
@@ -2674,7 +2708,7 @@ export function TeacherDashboard() {
                         <tr key={s.id} className="border-b last:border-b-0 hover:bg-muted/30 transition-colors">
                           <td className="px-4 py-2.5">
                             <div className="flex items-center gap-2">
-                              <StudentAvatar name={s.name} size={28} photoUrl={s.profile_photo_url} />
+                              <StudentAvatar name={s.name} size={28} photoPath={s.photo_url} />
                               <p className="text-xs font-medium text-foreground">{s.name}</p>
                             </div>
                           </td>
@@ -2850,6 +2884,17 @@ export function TeacherDashboard() {
                 </div>
               )}
 
+              {certClassId && (
+                <CertificateCompletionPanel classId={certClassId} refreshKey={certRevokeCount} onIssued={() => loadCertClass(certClassId)} />
+              )}
+
+              {certActionError && (
+                <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
+                  <span className="text-xs text-destructive">{certActionError}</span>
+                  <button type="button" className="text-xs text-muted-foreground hover:text-foreground cursor-pointer" onClick={() => setCertActionError("")} aria-label="Dismiss"><X className="w-3.5 h-3.5" /></button>
+                </div>
+              )}
+
               {certClassId && (certModulesLoading ? (
                 <div className="flex items-center justify-center py-12 gap-2 text-xs text-muted-foreground">
                   <Loader2 className="w-4 h-4 animate-spin" /> Loading…
@@ -2857,37 +2902,44 @@ export function TeacherDashboard() {
               ) : (
                 <>
                   {/* ── Special / Custom Certificates ───────────────────── */}
-                  {certCustomCerts.length > 0 && (
+                  {certCustomCerts.length > 0 && (() => {
+                    const activeCustom = certCustomCerts.filter(c => !isRevoked(c))
+                    return (
                     <div className="skillio-card overflow-hidden">
                       {/* Header row */}
                       <div className="flex items-center justify-between px-4 py-3 bg-muted/30 border-b gap-2 flex-wrap">
                         <div className="flex items-center gap-2.5 min-w-0">
-                          <input
-                            type="checkbox"
-                            className="rounded cursor-pointer"
-                            checked={certBulkIds.size === certCustomCerts.length && certCustomCerts.length > 0}
-                            onChange={e => setCertBulkIds(e.target.checked ? new Set(certCustomCerts.map(c => c._id)) : new Set())}
-                          />
+                          {activeCustom.length > 0 && (
+                            <input
+                              type="checkbox"
+                              className="rounded cursor-pointer"
+                              aria-label="Select all active special certificates"
+                              checked={certBulkIds.size === activeCustom.length}
+                              onChange={e => setCertBulkIds(e.target.checked ? new Set(activeCustom.map(c => c._id)) : new Set())}
+                            />
+                          )}
                           <div>
                             <p className="text-xs font-bold text-foreground">Special Awards</p>
-                            <p className="text-[11px] text-muted-foreground">{certCustomCerts.length} custom certificate{certCustomCerts.length !== 1 ? "s" : ""} issued</p>
+                            <p className="text-[11px] text-muted-foreground">{activeCustom.length} active{certCustomCerts.length > activeCustom.length ? ` · ${certCustomCerts.length - activeCustom.length} revoked` : ""}</p>
                           </div>
                         </div>
                         {certBulkIds.size > 0 && !certBulkConfirm && (
                           <Button size="sm" className="text-xs rounded-[20px] gap-1 h-7 text-white border-0 bg-destructive hover:bg-destructive/90"
-                            onClick={() => setCertBulkConfirm(true)}>
-                            <Trash2 className="w-3 h-3" />Delete {certBulkIds.size} selected
+                            onClick={() => { setCertRevokeReason(""); setCertBulkConfirm(true) }}>
+                            <Ban className="w-3 h-3" />Revoke {certBulkIds.size} selected
                           </Button>
                         )}
                       </div>
 
                       {/* Inline confirmation banner */}
                       {certBulkConfirm && (
-                        <div className="flex items-center justify-between px-4 py-2.5 bg-destructive/5 border-b border-destructive/20 gap-2 flex-wrap">
+                        <div className="flex flex-col gap-2 px-4 py-2.5 bg-destructive/5 border-b border-destructive/20">
                           <p className="text-xs text-destructive font-medium">
-                            Delete {certBulkIds.size} certificate{certBulkIds.size !== 1 ? "s" : ""}? This cannot be undone.
+                            Revoke {certBulkIds.size} certificate{certBulkIds.size !== 1 ? "s" : ""}? They stay on record marked "Revoked" and can no longer be downloaded.
                           </p>
-                          <div className="flex gap-2">
+                          <Input className="h-8 text-xs" maxLength={300} placeholder="Reason (optional), e.g. issued to the wrong student"
+                            aria-label="Reason for revoking" value={certRevokeReason} onChange={e => setCertRevokeReason(e.target.value)} />
+                          <div className="flex gap-2 justify-end">
                             <Button size="sm" variant="outline" className="text-xs rounded-[20px] h-7"
                               disabled={certBulkDeleting}
                               onClick={() => { setCertBulkConfirm(false) }}>
@@ -2895,8 +2947,8 @@ export function TeacherDashboard() {
                             </Button>
                             <Button size="sm" className="text-xs rounded-[20px] h-7 text-white border-0 bg-destructive hover:bg-destructive/90"
                               disabled={certBulkDeleting}
-                              onClick={handleBulkDeleteCerts}>
-                              {certBulkDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Deleting…</> : "Confirm Delete"}
+                              onClick={handleBulkRevokeCerts}>
+                              {certBulkDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Revoking…</> : "Confirm Revoke"}
                             </Button>
                           </div>
                         </div>
@@ -2904,16 +2956,27 @@ export function TeacherDashboard() {
 
                       {/* Certificate rows */}
                       <div className="divide-y divide-border">
-                        {certCustomCerts.map(cert => (
+                        {certCustomCerts.map(cert => isRevoked(cert) ? (
+                          <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs font-medium text-foreground truncate">{cert.student_name}</p>
+                              <p className="text-[10px] text-muted-foreground truncate">
+                                {cert.custom_title} — revoked{cert.revoked_at ? ` ${new Date(cert.revoked_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}` : ""}{cert.revoke_reason ? `: ${cert.revoke_reason}` : ""}
+                              </p>
+                            </div>
+                            <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-muted text-muted-foreground flex-shrink-0">Revoked</span>
+                          </div>
+                        ) : (
                           <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2">
                             <div className="flex items-center gap-2.5 min-w-0">
                               <input
                                 type="checkbox"
                                 className="rounded cursor-pointer flex-shrink-0"
+                                aria-label={`Select ${cert.student_name}'s certificate`}
                                 checked={certBulkIds.has(cert._id)}
                                 onChange={e => setCertBulkIds(prev => {
                                   const next = new Set(prev)
-                                  e.target.checked ? next.add(cert._id) : next.delete(cert._id)
+                                  if (e.target.checked) next.add(cert._id); else next.delete(cert._id)
                                   return next
                                 })}
                               />
@@ -2932,20 +2995,22 @@ export function TeacherDashboard() {
                                 <Eye className="w-3 h-3" />View
                               </Button>
                               <Button size="sm" variant="outline" className="text-xs rounded-[20px] gap-1 h-7"
+                                aria-label={`Download ${cert.student_name}'s certificate`}
                                 onClick={() => downloadCertPDF(cert._id, cert.student_name)}>
                                 <Download className="w-3 h-3" />
                               </Button>
                               <Button size="sm" variant="outline" className="text-xs rounded-[20px] gap-1 h-7 text-destructive hover:text-destructive border-destructive/30"
-                                disabled={certRevoking === cert._id}
-                                onClick={() => handleRevokeCert(cert._id)}>
-                                {certRevoking === cert._id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                                aria-label={`Revoke ${cert.student_name}'s certificate`}
+                                onClick={() => { setCertRevokeReason(""); setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: cert.custom_title }) }}>
+                                <Ban className="w-3 h-3" />
                               </Button>
                             </div>
                           </div>
                         ))}
                       </div>
                     </div>
-                  )}
+                    )
+                  })()}
 
                   {/* ── Module Certificates ──────────────────────────────── */}
                   {certModules.length === 0 && certCustomCerts.length === 0 && certRemovedModules.length === 0 ? (
@@ -2956,25 +3021,43 @@ export function TeacherDashboard() {
                     return (
                       <>
                         {/* Modules with certificates — full detail card */}
-                        {certifiedModules.map(mod => (
-                          <div key={mod.module_id} className="skillio-card overflow-hidden">
+                        {certifiedModules.map(mod => {
+                          const activeCount = mod.certificates.filter(c => !isRevoked(c)).length
+                          const zipTarget = mod.module_id ? { moduleId: mod.module_id } : { subject: mod.subject }
+                          const zipKey = mod.module_id ?? `subject:${mod.subject}`
+                          return (
+                          <div key={zipKey} className="skillio-card overflow-hidden">
                             <div className="flex items-center justify-between px-4 py-3 bg-muted/30 border-b gap-2">
                               <div className="min-w-0">
-                                <p className="text-xs font-bold text-foreground truncate">{mod.module_title}</p>
-                                <p className="text-[11px] text-muted-foreground">{mod.subject} · {mod.certificates.length} certificate{mod.certificates.length !== 1 ? "s" : ""} issued</p>
+                                <p className="text-xs font-bold text-foreground truncate">{mod.module_title}{mod.module_id ? "" : " · subject certificate"}</p>
+                                <p className="text-[11px] text-muted-foreground">
+                                  {mod.subject} · {activeCount} active{mod.certificates.length > activeCount ? ` · ${mod.certificates.length - activeCount} revoked` : ""}
+                                </p>
                               </div>
-                              <Button size="sm" variant="outline" className="text-xs rounded-[20px] gap-1 flex-shrink-0"
-                                disabled={certBulkLoading === mod.module_id}
-                                onClick={() => handleBulkDownload(mod.module_id)}>
-                                {certBulkLoading === mod.module_id
-                                  ? <><Loader2 className="w-3 h-3 animate-spin" />Generating…</>
-                                  : <><Download className="w-3 h-3" />All ({mod.certificates.length}) ZIP</>}
-                              </Button>
+                              {activeCount > 0 && (
+                                <Button size="sm" variant="outline" className="text-xs rounded-[20px] gap-1 flex-shrink-0"
+                                  disabled={certBulkLoading === zipKey}
+                                  onClick={() => handleBulkDownload(zipTarget)}>
+                                  {certBulkLoading === zipKey
+                                    ? <><Loader2 className="w-3 h-3 animate-spin" />Preparing…</>
+                                    : <><Download className="w-3 h-3" />All ({activeCount}) ZIP</>}
+                                </Button>
+                              )}
                             </div>
 
                             {/* Compact two-column grid — shows 2 students per row for easy scanning */}
                             <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:gap-px sm:bg-border">
-                              {mod.certificates.map(cert => (
+                              {mod.certificates.map(cert => isRevoked(cert) ? (
+                                <div key={cert._id} className="flex items-center justify-between px-3 py-2 gap-2 bg-background sm:border-b sm:border-border">
+                                  <div className="min-w-0">
+                                    <p className="text-xs font-semibold text-foreground truncate leading-tight">{cert.student_name}</p>
+                                    <p className="text-[10px] text-muted-foreground leading-tight truncate">
+                                      Revoked{cert.revoked_at ? ` ${new Date(cert.revoked_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}` : ""}{cert.revoke_reason ? ` — ${cert.revoke_reason}` : ""}
+                                    </p>
+                                  </div>
+                                  <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-muted text-muted-foreground flex-shrink-0">Revoked</span>
+                                </div>
+                              ) : (
                                 <div key={cert._id} className="flex items-center justify-between px-3 py-2 gap-2 bg-background sm:border-b sm:border-border">
                                   {/* Student info */}
                                   <div className="flex items-center gap-2 min-w-0">
@@ -2999,20 +3082,21 @@ export function TeacherDashboard() {
                                       onClick={() => downloadCertPDF(cert._id, cert.student_name)}>
                                       <Download className="w-3.5 h-3.5" />
                                     </button>
-                                    <button title="Delete certificate" aria-label={`Delete certificate for ${cert.student_name}`}
+                                    <button title="Revoke certificate" aria-label={`Revoke certificate for ${cert.student_name}`}
                                       disabled={certModuleDeleting === cert._id}
                                       className="min-w-[44px] min-h-[44px] rounded-[6px] flex items-center justify-center text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer disabled:opacity-40"
-                                      onClick={() => setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: mod.module_title })}>
+                                      onClick={() => { setCertRevokeReason(""); setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: mod.module_title }) }}>
                                       {certModuleDeleting === cert._id
                                         ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        : <Trash2 className="w-3.5 h-3.5" />}
+                                        : <Ban className="w-3.5 h-3.5" />}
                                     </button>
                                   </div>
                                 </div>
                               ))}
                             </div>
                           </div>
-                        ))}
+                          )
+                        })}
 
                         {/* Modules with zero certificates — collapsed by default */}
                         {emptyModules.length > 0 && (
@@ -3062,7 +3146,12 @@ export function TeacherDashboard() {
                                   <div key={group.module_title + group.subject} className="px-4 py-2.5">
                                     <p className="text-xs font-medium text-foreground">{group.module_title} <span className="text-[10px] text-muted-foreground font-normal">· {group.subject} · module removed</span></p>
                                     <div className="mt-1.5 flex flex-col gap-1">
-                                      {group.certificates.map(cert => (
+                                      {group.certificates.map(cert => isRevoked(cert) ? (
+                                        <div key={cert._id} className="flex items-center justify-between gap-2">
+                                          <span className="text-[11px] text-muted-foreground truncate">{cert.student_name}</span>
+                                          <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-muted text-muted-foreground flex-shrink-0">Revoked</span>
+                                        </div>
+                                      ) : (
                                         <div key={cert._id} className="flex items-center justify-between gap-2">
                                           <span className="text-[11px] text-muted-foreground truncate">{cert.student_name}</span>
                                           <div className="flex items-center gap-0.5 flex-shrink-0">
@@ -3096,16 +3185,18 @@ export function TeacherDashboard() {
                       <div role="alertdialog" aria-modal="true" aria-labelledby="cert-delete-heading" className="bg-background rounded-[16px] shadow-xl w-full max-w-sm p-5 flex flex-col gap-4">
                         <div className="flex items-start gap-3">
                           <div className="w-9 h-9 rounded-full bg-destructive/10 flex items-center justify-center flex-shrink-0">
-                            <Trash2 className="w-4 h-4 text-destructive" />
+                            <Ban className="w-4 h-4 text-destructive" />
                           </div>
                           <div>
-                            <p id="cert-delete-heading" className="text-sm font-bold text-foreground">Delete certificate?</p>
+                            <p id="cert-delete-heading" className="text-sm font-bold text-foreground">Revoke certificate?</p>
                             <p className="text-xs text-muted-foreground mt-1">
-                              This will remove <span className="font-semibold text-foreground">{certDeleteConfirm.studentName}</span>'s certificate for <span className="font-semibold text-foreground">"{certDeleteConfirm.moduleTitle}"</span>.
-                              They will be able to re-claim it by completing the module again.
+                              <span className="font-semibold text-foreground">{certDeleteConfirm.studentName}</span>'s certificate for <span className="font-semibold text-foreground">"{certDeleteConfirm.moduleTitle}"</span> will
+                              stay on record marked "Revoked" and can no longer be downloaded. You can issue it again later.
                             </p>
                           </div>
                         </div>
+                        <Input className="h-9 text-xs" maxLength={300} placeholder="Reason (optional), e.g. issued to the wrong student"
+                          autoFocus aria-label="Reason for revoking" value={certRevokeReason} onChange={e => setCertRevokeReason(e.target.value)} />
                         <div className="flex gap-2 justify-end">
                           <Button size="sm" variant="outline" className="text-xs rounded-[20px]"
                             onClick={() => setCertDeleteConfirm(null)}>
@@ -3113,8 +3204,8 @@ export function TeacherDashboard() {
                           </Button>
                           <Button size="sm" className="text-xs rounded-[20px] text-white border-0 bg-destructive hover:bg-destructive/90"
                             disabled={!!certModuleDeleting}
-                            onClick={handleDeleteModuleCert}>
-                            {certModuleDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Deleting…</> : "Delete"}
+                            onClick={handleConfirmRevoke}>
+                            {certModuleDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Revoking…</> : "Revoke"}
                           </Button>
                         </div>
                       </div>
@@ -3209,7 +3300,7 @@ export function TeacherDashboard() {
                   <Button size="sm" variant="outline" className="text-xs rounded-[20px]" onClick={() => { setCertIssueOpen(false); setCertIssueTemplate(null) }}>Cancel</Button>
                   <Button size="sm" className="text-xs rounded-[20px] text-white border-0 gap-1"
                     style={{ background: "linear-gradient(135deg,#534AB7,#7970D6)" }}
-                    disabled={!certIssueTitle.trim() || certSelectedIds.size === 0 || certIssueLoading}
+                    disabled={!certIssueTitle.trim() || !certIssueTemplate || certSelectedIds.size === 0 || certIssueLoading}
                     onClick={handleIssueCerts}>
                     {certIssueLoading ? <><Loader2 className="w-3 h-3 animate-spin" />Issuing…</> : `Issue to ${certSelectedIds.size || 0} student${certSelectedIds.size !== 1 ? "s" : ""}`}
                   </Button>
@@ -3309,15 +3400,6 @@ export function TeacherDashboard() {
       {/* ═══════════════════════════════════════════════════════════════════════
           NOTIFICATIONS VIEW
       ════════════════════════════════════════════════════════════════════════ */}
-      {view === "notifications" && !tNotifHistoryLoaded && (() => {
-        // Load sent notification history when entering the notifications view
-        getTeacherSentNotifications().then(res => {
-          setTNotifHistoryLoaded(true)
-          if (!("error" in res)) setTNotifHistory(res.notifications)
-        })
-        return null
-      })()}
-
       {view === "notifications" && (() => {
         const TNOTIF_TYPES: Array<{ value: NotifType; label: string; emoji: string; color: string; desc: string }> = [
           { value: "announcement", label: "Announcement", emoji: "📢", color: "#534AB7", desc: "General info, class updates" },
@@ -3955,13 +4037,43 @@ export function TeacherDashboard() {
 
               // All file items use pre-fetched blob URLs (auth token never in URL)
               if (viewerItem.type === "file") {
-                if (viewerBlobLoading) return (
-                  <div className="flex items-center justify-center h-full gap-3 text-muted-foreground text-sm">
+                const slideState = slideConversionState(viewerItem)
+                if (slideState === "converting" || slideState === "failed") return (
+                  <div className="flex items-center justify-center h-full bg-muted/20 p-4">
+                    <div role="status" className="flex flex-col items-center gap-4 p-8 rounded-2xl bg-card border border-border shadow-sm max-w-sm text-center">
+                      <span className="text-5xl" aria-hidden="true">📊</span>
+                      <div>
+                        <p className="text-base font-semibold text-foreground">{viewerItem.label}</p>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {slideState === "converting"
+                            ? "These slides are being prepared so students can view them. This usually takes under a minute."
+                            : "We couldn't prepare these slides for students. Please delete this item and upload it again, or upload it as a PDF."}
+                        </p>
+                      </div>
+                      {slideState === "converting" ? (
+                        <Button size="sm" className="text-xs rounded-[20px]" disabled={slideChecking} onClick={() => recheckSlideConversion(viewerItem)}>
+                          {slideChecking ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Checking…</> : "Check again"}
+                        </Button>
+                      ) : (
+                        <Button size="sm" variant="outline" className="text-xs rounded-[20px] gap-1" onClick={() => { setViewerDownloadError(""); downloadOriginalLessonFile(viewerItem) }}>
+                          <Download className="w-3 h-3" />Download original
+                        </Button>
+                      )}
+                      {viewerDownloadError && <p role="alert" className="text-xs text-destructive">{viewerDownloadError}</p>}
+                    </div>
+                  </div>
+                )
+                if (isStreamedVideo(viewerItem)) return <LessonVideo key={viewerItem._id} item={viewerItem} />
+                if (viewerBlobLoading || (!viewerBlobUrl && !viewerFailed)) return (
+                  <div role="status" className="flex items-center justify-center h-full gap-3 text-muted-foreground text-sm">
                     <Loader2 className="w-5 h-5 animate-spin" /> Loading file…
                   </div>
                 )
-                if (!viewerBlobUrl) return (
-                  <div className="flex items-center justify-center h-full text-muted-foreground text-sm">Failed to load file.</div>
+                if (viewerFailed || !viewerBlobUrl) return (
+                  <div role="alert" className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground text-sm">
+                    <p>This file could not be loaded. Please check your connection and try again.</p>
+                    <Button size="sm" variant="outline" onClick={() => setViewerRetry(n => n + 1)}>Try again</Button>
+                  </div>
                 )
 
                 if (["jpg","jpeg","png","webp","gif"].includes(ft)) {
@@ -3972,36 +4084,7 @@ export function TeacherDashboard() {
                   )
                 }
 
-                if (["mp4","webm"].includes(ft)) {
-                  return (
-                    <div className="flex items-center justify-center h-full bg-black">
-                      <video src={viewerBlobUrl} controls className="max-h-full max-w-full" />
-                    </div>
-                  )
-                }
 
-                if (needsDownloadFallback(viewerItem)) {
-                  return (
-                    <div className="flex items-center justify-center h-full bg-muted/20">
-                      <div className="flex flex-col items-center gap-5 p-8 rounded-2xl bg-card border border-border shadow-sm max-w-sm text-center">
-                        <span className="text-5xl">📊</span>
-                        <div>
-                          <p className="text-base font-semibold text-foreground">{viewerItem.label}</p>
-                          <p className="text-xs text-muted-foreground mt-1">PPTX · PDF preview not yet generated</p>
-                        </div>
-                        <a
-                          href={viewerBlobUrl}
-                          download={viewerItem.file_name ?? viewerItem.label}
-                          className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium text-white transition-opacity hover:opacity-90"
-                          style={{ background: "var(--ts-blue)" }}
-                        >
-                          Download to open
-                        </a>
-                        <p className="text-[11px] text-muted-foreground">PDF preview is generated automatically when LibreOffice is installed on the server</p>
-                      </div>
-                    </div>
-                  )
-                }
 
                 // PDF / PPTX-with-PDF / DOCX / other viewable files
                 return (

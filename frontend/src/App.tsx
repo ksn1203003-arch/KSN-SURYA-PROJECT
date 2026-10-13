@@ -22,6 +22,7 @@ import { SetPasswordPage } from "@/pages/SetPasswordPage"
 import { NotFoundPage } from "@/pages/NotFoundPage"
 import { LegalPage } from "@/pages/LegalPage"
 import { PWAUpdateBanner } from "@/components/PWAUpdateBanner"
+import { DASHBOARD_ROLES, dashboardPathForRole, WRONG_ROLE_NOTICE } from "@/lib/dashboardRoutes"
 
 // Lazy-load the dashboard files — each is only fetched when the user navigates
 // to that role's route, reducing initial bundle size significantly.
@@ -123,9 +124,13 @@ function RequireAuth({ children, roles }: { children: React.ReactNode; roles: st
     </div>
   )
   if (!user) return <Navigate to={`/login?redirect=${encodeURIComponent(location.pathname)}`} replace />
-  if (!roles.includes(user.role)) return <Navigate to="/" replace />
+  // A signed-in user who opens another role's dashboard goes to their own dashboard with a short notice
+  // (shown by DashboardLayout) — never a blank page or an error.
+  if (!roles.includes(user.role)) {
+    return <Navigate to={dashboardPathForRole(user.role)} replace state={{ notice: WRONG_ROLE_NOTICE }} />
+  }
   if (user.must_change_password) {
-    return <Navigate to="/set-password?forced=1" replace />
+    return <Navigate to={`/set-password?forced=1&redirect=${encodeURIComponent(location.pathname)}`} replace />
   }
   return <>{children}</>
 }
@@ -165,9 +170,9 @@ function AppRoutes() {
       <Route path="/set-password" element={<SetPasswordPage />} />
       <Route path="/legal/:type" element={<LegalPage />} />
       <Route
-        path="/student/dashboard"
+        path="/student/dashboard/*"
         element={
-          <RequireAuth roles={["student"]}>
+          <RequireAuth roles={[...DASHBOARD_ROLES.student]}>
             <StudentDashboard />
           </RequireAuth>
         }
@@ -175,7 +180,7 @@ function AppRoutes() {
       <Route
         path="/teacher/dashboard"
         element={
-          <RequireAuth roles={["teacher", "admin", "super_admin"]}>
+          <RequireAuth roles={[...DASHBOARD_ROLES.teacher]}>
             <TeacherDashboard />
           </RequireAuth>
         }
@@ -183,7 +188,7 @@ function AppRoutes() {
       <Route
         path="/admin/dashboard"
         element={
-          <RequireAuth roles={["admin", "super_admin"]}>
+          <RequireAuth roles={[...DASHBOARD_ROLES.admin]}>
             <AdminDashboard />
           </RequireAuth>
         }
@@ -191,7 +196,7 @@ function AppRoutes() {
       <Route
         path="/parent/dashboard"
         element={
-          <RequireAuth roles={["parent"]}>
+          <RequireAuth roles={[...DASHBOARD_ROLES.parent]}>
             <ParentDashboard />
           </RequireAuth>
         }

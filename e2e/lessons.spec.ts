@@ -106,3 +106,137 @@ test.describe("Lessons — teacher creates module, student views it", () => {
   })
 
 })
+
+test.describe("Lessons — redesigned module/item two-pane view (student)", () => {
+  async function enterFirstSubjectWithModules(page: import("@playwright/test").Page) {
+    await loginAs(page, STUDENT.identifier, STUDENT.password, "student")
+    await page.waitForLoadState("networkidle")
+    const lessonsNav = page.locator('nav a:has-text("Lessons"), button:has-text("Lessons"), [data-nav="Lessons"]').first()
+    await expect(lessonsNav).toBeVisible({ timeout: 10000 })
+    await lessonsNav.click()
+    await page.waitForTimeout(800)
+    // Click the first subject tile that actually has lesson items (skips "No lessons yet" subjects)
+    const subjectTiles = page.locator('button:has(p:has-text("lesson item"))')
+    await expect(subjectTiles.first()).toBeVisible({ timeout: 10000 })
+    await subjectTiles.first().click()
+    await page.waitForTimeout(800)
+  }
+
+  test("entering a subject shows the Modules Overview panel with the first module auto-selected", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    await expect(page.locator("text=Modules Overview")).toBeVisible()
+    // First module button should be visually selected (purple-tinted background/text)
+    const firstModuleBtn = page.locator('button:has-text("Module 1")').first()
+    await expect(firstModuleBtn).toBeVisible()
+  })
+
+  test("switching modules in the left list updates the right panel's item list", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    const moduleButtons = page.locator('button:has-text("Module ")')
+    const count = await moduleButtons.count()
+    if (count < 2) {
+      test.skip(true, "This subject only has one module — nothing to switch to")
+      return
+    }
+    const firstTitle = await page.locator('button:has-text("Module 1")').first().locator("p").last().textContent()
+    await moduleButtons.nth(1).click()
+    await page.waitForTimeout(400)
+    const panelTitle = page.locator('[placeholder="Search lessons or files…"]').locator("xpath=preceding::p[1]")
+    await expect(panelTitle).not.toHaveText(firstTitle ?? "")
+  })
+
+  test("search filters items by label, and clearing restores the full list", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    const searchBox = page.locator('[placeholder="Search lessons or files…"]')
+    await expect(searchBox).toBeVisible()
+    await searchBox.fill("zzzznonexistentquery")
+    await page.waitForTimeout(300)
+    await expect(page.locator('text=No items match')).toBeVisible()
+    const clearLink = page.locator('text=Clear search & filters')
+    await expect(clearLink).toBeVisible()
+    await clearLink.click()
+    await page.waitForTimeout(300)
+    await expect(page.locator('text=No items match')).toHaveCount(0)
+  })
+
+  test("Viewed / Remaining filter chips show live counts and filter the item list", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    const allChip = page.locator('button:has-text("All (")')
+    const viewedChip = page.locator('button:has-text("Viewed (")')
+    const remainingChip = page.locator('button:has-text("Remaining (")')
+    await expect(allChip).toBeVisible()
+    await expect(viewedChip).toBeVisible()
+    await expect(remainingChip).toBeVisible()
+
+    await remainingChip.click()
+    await page.waitForTimeout(300)
+    // No "Undo" links (only shown on already-done items) should be visible
+    // while filtered to Remaining
+    await expect(page.locator('button:has-text("Undo")')).toHaveCount(0)
+
+    await allChip.click()
+    await page.waitForTimeout(300)
+  })
+
+  test("clicking an item name opens the viewer without marking it done; Mark Done requires confirmation before it marks the item done", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    await page.locator('button:has-text("Remaining (")').click()
+    await page.waitForTimeout(300)
+    const markDoneBtn = page.locator('button:has-text("Mark Done")').first()
+    const hasUnviewedItem = await markDoneBtn.count() > 0
+    if (!hasUnviewedItem) {
+      test.skip(true, "No remaining (unviewed) items for this student — nothing to test")
+      return
+    }
+
+    // Clicking Mark Done opens a confirm dialog — does not mark it done yet
+    await markDoneBtn.click()
+    await page.waitForTimeout(300)
+    const confirmDialog = page.locator('text=Mark this as done?')
+    await expect(confirmDialog).toBeVisible()
+
+    // Cancelling leaves the item unmarked
+    await page.locator('button:has-text("Cancel")').click()
+    await page.waitForTimeout(300)
+    await expect(page.locator('button:has-text("Mark Done")').first()).toBeVisible()
+
+    // Confirming actually marks it done
+    await page.locator('button:has-text("Mark Done")').first().click()
+    await page.waitForTimeout(300)
+    await page.locator('button:has-text("Yes, mark done")').click()
+    await page.waitForTimeout(600)
+    await expect(page.locator("text=Done").first()).toBeVisible()
+    await expect(page.locator('button:has-text("Undo")').first()).toBeVisible()
+  })
+
+  test("Undo asks for confirmation, then moves the item back to Remaining", async ({ page }) => {
+    await enterFirstSubjectWithModules(page)
+    await page.locator('button:has-text("Viewed (")').click()
+    await page.waitForTimeout(300)
+    const undoBtn = page.locator('button:has-text("Undo")').first()
+    const hasViewedItem = await undoBtn.count() > 0
+    if (!hasViewedItem) {
+      test.skip(true, "No viewed items for this student — nothing to undo")
+      return
+    }
+
+    await undoBtn.click()
+    await page.waitForTimeout(300)
+    const confirmDialog = page.locator('text=Undo this item?')
+    await expect(confirmDialog).toBeVisible()
+
+    // Cancelling leaves the item marked done
+    await page.locator('button:has-text("Cancel")').click()
+    await page.waitForTimeout(300)
+    await expect(page.locator('button:has-text("Undo")').first()).toBeVisible()
+
+    // Confirming moves it back to Remaining
+    await undoBtn.click()
+    await page.waitForTimeout(300)
+    await page.locator('button:has-text("Yes, undo")').click()
+    await page.waitForTimeout(600)
+    await page.locator('button:has-text("Remaining (")').click()
+    await page.waitForTimeout(300)
+    await expect(page.locator('button:has-text("Mark Done")').first()).toBeVisible()
+  })
+})

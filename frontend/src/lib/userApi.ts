@@ -3,7 +3,8 @@
 // Covers: school info, class CRUD, timetable, user management, attendance,
 // notifications, teacher clock-in/out, and Excel exports.
 // ─────────────────────────────────────────────────────────────────────────────
-import * as XLSX from "xlsx"
+import { loadXlsx } from "./excel"
+import { registerSessionCache } from "./sessionCaches"
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:4000"
 
@@ -24,7 +25,15 @@ async function authFetch(path: string, options: RequestInit = {}): Promise<unkno
     })
     const data = await res.json()
     if (!res.ok) {
-      return { error: (data as { error?: string }).error ?? `Request failed (${res.status})`, requestId }
+      const body = data as { error?: string; code?: unknown; year_start_effective?: unknown; year_start?: unknown }
+      return {
+        error: body.error ?? `Request failed (${res.status})`,
+        requestId,
+        ...(typeof body.code === "string" ? { code: body.code } : {}),
+        ...(typeof body.year_start_effective === "string" ? { year_start_effective: body.year_start_effective } : {}),
+        // The date the admin really saved (null = none); never the default shown when no date is saved
+        ...(typeof body.year_start === "string" || body.year_start === null ? { year_start: body.year_start } : {}),
+      }
     }
     return data
   } catch (err) {
@@ -37,7 +46,7 @@ async function authFetch(path: string, options: RequestInit = {}): Promise<unkno
 
 export async function getMyClass(): Promise<{
   class: { id: string; grade: number; section: string; label: string; teacher_name?: string | null; subject_teachers?: Array<{ teacher_id: string | null; teacher_name: string | null; subject: string }> } | null
-  students: Array<{ id: string; name: string; username: string | null; is_active: boolean; profile_photo_url: string | null }>
+  students: Array<{ id: string; name: string; username: string | null; is_active: boolean; photo_url: string | null }>
 } | { error: string }> {
   return authFetch("/api/school/my-class") as never
 }
@@ -60,43 +69,111 @@ export async function toggleTwoFactor(
 
 export async function getClasses(): Promise<{
   classes: Array<{
-    id: string; grade: number; section: string; teacher_id: string | null; teacher_name: string | null; student_count: number
+    id: string; grade: number; section: string; name: string | null; subjects: string[]
+    year_start: string | null; year_start_effective: string; has_start_date: boolean
+    teacher_id: string | null; teacher_name: string | null; student_count: number
     teachers: Array<{ teacher_id: string; teacher_name: string | null; subject: string }>
   }>
 } | { error: string }> {
   return authFetch("/api/school/classes") as never
 }
 
-export async function createClass(name: string, subjects?: string[]): Promise<{ class: { id: string; grade: number; section: string; name: string | null; subjects: string[] } } | { error: string }> {
+export async function createClass(name: string, subjects?: string[], yearStart?: string): Promise<{ class: { id: string; grade: number; section: string; name: string | null; subjects: string[]; year_start: string | null; year_start_effective: string } } | { error: string }> {
   return authFetch("/api/school/classes", {
     method: "POST",
-    body: JSON.stringify({ name, subjects }),
+    body: JSON.stringify({ name, subjects, ...(yearStart ? { year_start: yearStart } : {}) }),
   }) as never
 }
 
-export async function updateClass(id: string, data: { name?: string; subjects?: string[] }): Promise<{ success: boolean; name: string | null; subjects: string[] } | { error: string }> {
-  return authFetch(`/api/school/classes/${id}`, {
+// A failed class / year-start call: `code`, `year_start_effective` and `year_start` are passed through by authFetch
+export interface YearStartFailure { error: string; code?: string; year_start_effective?: string; year_start?: string | null; requestId?: string }
+
+export type UpdateClassResult =
+  | {
+      success: boolean; name: string | null; subjects: string[]
+      year_start: string | null; year_start_effective: string
+      sheets_leaving: number; sheets_entering: number
+    }
+  | YearStartFailure
+
+export async function updateClass(id: string, data: {
+  name?: string; subjects?: string[]; year_start?: string; expected_current?: string | null; reason?: string
+}): Promise<UpdateClassResult> {
+  const res = await (authFetch(`/api/school/classes/${id}`, {
     method: "PATCH",
     body: JSON.stringify(data),
-  }) as never
+  }) as Promise<UpdateClassResult>)
+  // A changed year start is read by the class list — the next reader must see the saved value
+  if (!("error" in res) && data.year_start) teacherClassesRequest = null
+  return res
+}
+
+// What a date change would do to saved attendance sheets — writes nothing
+export interface YearStartPreview {
+  current: string | null; date: string; sheets_leaving: number; sheets_entering: number
+}
+
+export async function getYearStartPreview(classId: string, date: string): Promise<YearStartPreview | YearStartFailure> {
+  return authFetch(`/api/school/classes/${encodeURIComponent(classId)}/year-start-preview?date=${encodeURIComponent(date)}`) as Promise<YearStartPreview | YearStartFailure>
+}
+
+export type BulkYearStartStatus = "saved" | "unchanged" | "skipped_has_date" | "conflict" | "not_found" | "error"
+export interface BulkYearStartResult { id: string; status: BulkYearStartStatus; year_start?: string | null }
+export interface BulkYearStartBody {
+  year_start: string
+  classes: Array<{ id: string; expected_current: string | null }>
+  include_dated?: boolean
+  reason?: string
+}
+export type BulkYearStartResponse = { results: BulkYearStartResult[]; updated: number } | YearStartFailure
+
+export async function bulkSetYearStart(body: BulkYearStartBody): Promise<BulkYearStartResponse> {
+  const res = await (authFetch("/api/school/classes-year-start", {
+    method: "POST",
+    body: JSON.stringify(body),
+  }) as Promise<BulkYearStartResponse>)
+  // The teacher class list carries year_start — the next reader must see the saved value
+  if (!("error" in res)) teacherClassesRequest = null
+  return res
 }
 
 export async function saveTimetable(classId: string, slots: Array<{ day: string; period: number; subject: string; teacher_id?: string; start_time: string; end_time: string }>): Promise<{ success: boolean } | { error: string }> {
-  return authFetch(`/api/school/classes/${classId}/timetable`, {
+  const res = await (authFetch(`/api/school/classes/${classId}/timetable`, {
     method: "PUT",
     body: JSON.stringify({ slots }),
-  }) as never
+  }) as Promise<{ success: boolean } | { error: string }>)
+  if (!("error" in res)) teacherClassesRequest = null
+  return res
 }
 
-export async function getTeacherClasses(): Promise<{
-  classes: Array<{
-    id: string; grade: number; section: string; name: string | null; subjects: string[]
-    timetable: Array<{ day: string; period: number; subject: string; teacher_id: string | null; teacher_name: string | null; start_time: string; end_time: string }>
-    timetable_updated_by_name: string | null; timetable_updated_at: string | null
-  }>
-} | { error: string }> {
-  return authFetch("/api/teacher/my-classes") as never
+export interface TeacherClass {
+  id: string; grade: number; section: string; name: string | null; subjects: string[]
+  timetable: Array<{ day: string; period: number; subject: string; teacher_id: string | null; teacher_name: string | null; start_time: string; end_time: string }>
+  timetable_updated_by_name: string | null; timetable_updated_at: string | null
+  year_start: string | null; has_start_date: boolean
 }
+type TeacherClassesResult = { classes: TeacherClass[] } | { error: string }
+
+// The teacher's class list is needed by many sections (timetable, lessons, attendance,
+// quizzes, certificates…). One request is shared by all of them for a few minutes
+// instead of each section asking again. Cleared on sign-out and after a timetable save.
+const TEACHER_CLASSES_TTL_MS = 5 * 60_000
+let teacherClassesRequest: { promise: Promise<TeacherClassesResult>; at: number } | null = null
+
+export function getTeacherClasses(options: { fresh?: boolean } = {}): Promise<TeacherClassesResult> {
+  if (!options.fresh && teacherClassesRequest && Date.now() - teacherClassesRequest.at < TEACHER_CLASSES_TTL_MS) {
+    return teacherClassesRequest.promise
+  }
+  const promise = (authFetch("/api/teacher/my-classes") as Promise<TeacherClassesResult>).then(res => {
+    // Never keep a failed answer — the next caller should try again
+    if ("error" in res && teacherClassesRequest?.promise === promise) teacherClassesRequest = null
+    return res
+  })
+  teacherClassesRequest = { promise, at: Date.now() }
+  return promise
+}
+
+registerSessionCache(() => { teacherClassesRequest = null })
 
 export async function getTeacherTimetable(class_id: string): Promise<{
   class: { id: string; grade: number; section: string; name: string | null }
@@ -107,10 +184,13 @@ export async function getTeacherTimetable(class_id: string): Promise<{
 }
 
 export async function saveTeacherTimetable(classId: string, slots: Array<{ day: string; period: number; subject: string; teacher_id?: string | null; start_time: string; end_time: string }>): Promise<{ success: boolean } | { error: string }> {
-  return authFetch(`/api/teacher/timetable/${classId}`, {
+  const res = await (authFetch(`/api/teacher/timetable/${classId}`, {
     method: "PUT",
     body: JSON.stringify({ slots }),
-  }) as never
+  }) as Promise<{ success: boolean } | { error: string }>)
+  // The class list carries timetables — the next reader must see the saved version
+  if (!("error" in res)) teacherClassesRequest = null
+  return res
 }
 
 export async function getStudentTimetable(): Promise<{
@@ -126,20 +206,50 @@ export async function deleteClass(id: string): Promise<{ success: boolean } | { 
   return authFetch(`/api/school/classes/${id}`, { method: "DELETE" }) as never
 }
 
-export async function getTeachers(): Promise<{
-  teachers: Array<{
-    id: string; name: string; email: string; phone: string | null; is_active: boolean; class_label: string | null
-    subject_assignments: Array<{ class_label: string; subject: string }>
-  }>
-} | { error: string }> {
-  return authFetch("/api/school/teachers") as never
+// The server sends people lists in pages of at most 200. Rows are small (a photo is
+// only an address), so the admin screens load every page and then show 25 rows at a
+// time — search and filters keep working across the whole school.
+const LIST_PAGE_LIMIT = 200
+
+interface PagedList { pagination?: { pages?: number } }
+
+async function getAllPages<K extends string, Row>(
+  path: string, key: K,
+): Promise<Record<K, Row[]> | { error: string }> {
+  const sep = path.includes("?") ? "&" : "?"
+  const first = await authFetch(`${path}${sep}page=1&limit=${LIST_PAGE_LIMIT}`) as (Record<K, Row[]> & PagedList) | { error: string }
+  if ("error" in first) return first
+  const pages = first.pagination?.pages ?? 1
+  if (pages <= 1) return first
+  const rest = await Promise.all(
+    Array.from({ length: pages - 1 }, (_, i) =>
+      authFetch(`${path}${sep}page=${i + 2}&limit=${LIST_PAGE_LIMIT}`) as Promise<Record<K, Row[]> | { error: string }>),
+  )
+  const failed = rest.find((r): r is { error: string } => "error" in r)
+  if (failed) return failed
+  const rows = [...first[key], ...rest.flatMap(r => (r as Record<K, Row[]>)[key])]
+  return { [key]: rows } as Record<K, Row[]>
 }
 
-export async function getStudents(class_id?: string): Promise<{
-  students: Array<{ id: string; name: string; email: string; phone: string | null; username: string | null; gender: string | null; class_id: string | null; class_label: string | null; is_active: boolean; profile_photo_url: string | null }>
-} | { error: string }> {
-  const qs = class_id ? `?class_id=${class_id}` : ""
-  return authFetch(`/api/school/students${qs}`) as never
+export interface SchoolTeacherRow {
+  id: string; name: string; email: string; phone: string | null; is_active: boolean; class_label: string | null
+  photo_url: string | null; created_at: string | null
+  subject_assignments: Array<{ class_id: string; class_label: string; subject: string }>
+}
+
+export interface SchoolStudentRow {
+  id: string; name: string; email: string; phone: string | null; username: string | null; gender: string | null
+  class_id: string | null; class_label: string | null; is_active: boolean; photo_url: string | null
+  points: number; created_at: string | null
+}
+
+export async function getTeachers(): Promise<{ teachers: SchoolTeacherRow[] } | { error: string }> {
+  return getAllPages<"teachers", SchoolTeacherRow>("/api/school/teachers", "teachers")
+}
+
+export async function getStudents(class_id?: string): Promise<{ students: SchoolStudentRow[] } | { error: string }> {
+  const qs = class_id ? `?class_id=${encodeURIComponent(class_id)}` : ""
+  return getAllPages<"students", SchoolStudentRow>(`/api/school/students${qs}`, "students")
 }
 
 export async function inviteTeacher(data: {
@@ -202,8 +312,8 @@ function sheetToRows(file: File): Promise<Record<string, string>[]> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = e => {
-      try {
-        const data = e.target?.result
+      const data = e.target?.result
+      loadXlsx().then(XLSX => {
         const wb = XLSX.read(data, { type: "array" })
         const ws = wb.Sheets[wb.SheetNames[0]]
         const rows = XLSX.utils.sheet_to_json<Record<string, string>>(ws, { defval: "" })
@@ -214,7 +324,7 @@ function sheetToRows(file: File): Promise<Record<string, string>[]> {
           return out
         })
         resolve(normalised)
-      } catch (err) { reject(err) }
+      }).catch(reject)
     }
     reader.onerror = reject
     reader.readAsArrayBuffer(file)
@@ -331,7 +441,7 @@ export async function uploadAvatar(base64: string): Promise<{ user: unknown } | 
 export async function saveAttendance(data: {
   class_id: string; date: string; period: number; subject?: string
   records: Array<{ student_id: string; student_name: string; status: "present" | "absent" | "late" }>
-}): Promise<{ success: boolean } | { error: string }> {
+}): Promise<{ success: boolean } | { error: string; code?: string }> {
   return authFetch("/api/teacher/attendance", {
     method: "POST",
     body: JSON.stringify(data),
@@ -348,6 +458,8 @@ export async function getAttendance(class_id: string, date: string, period?: num
 
 export async function getStudentAttendance(): Promise<{
   records: Array<{ date: string; period: number; subject: string; status: string }>
+  counted_from?: string | null
+  counted_class_label?: string | null
 } | { error: string }> {
   return authFetch("/api/teacher/student-attendance") as never
 }
@@ -390,6 +502,9 @@ export interface StudentAttStats {
 export interface ClassAttStats {
   class_total: { today: AttSlot; this_week: AttSlot; this_month: AttSlot; this_year: AttSlot }
   students:    StudentAttStats[]
+  // Attendance is counted from the class's school-year start (YYYY-MM-DD); null = every recorded sheet
+  counted_from?:        string | null
+  counted_class_label?: string | null
 }
 
 export async function getClassAttendanceStats(class_id: string): Promise<ClassAttStats | { error: string }> {
@@ -401,6 +516,8 @@ export interface ClassRangeStats {
   students:    Array<{ student_id: string; name: string; slot: AttSlot }>
   from:        string
   to:          string
+  counted_from?:        string | null
+  counted_class_label?: string | null
 }
 
 export async function getClassAttendanceRange(
@@ -598,6 +715,10 @@ export interface AdminCertificate {
   custom_title: string
   custom_reason: string
   cert_template?: string | null
+  // Older certificates have no status — treat a missing status as "active"
+  status?: "active" | "revoked"
+  revoked_at?: string | null
+  revoke_reason?: string
 }
 
 export interface CertTemplateData {
@@ -615,7 +736,7 @@ export async function getAllCertificates(): Promise<{ certificates: IssuedCertif
 }
 
 export async function getCertsByClass(classId: string): Promise<{
-  modules: Array<{ module_id: string; module_title: string; subject: string; total_items: number; certificates: AdminCertificate[] }>
+  modules: Array<{ module_id: string | null; module_title: string; subject: string; total_items: number; certificates: AdminCertificate[] }>
   custom_certificates: AdminCertificate[]
 } | { error: string }> {
   return authFetch(`/api/certificates/class/${encodeURIComponent(classId)}`) as never
@@ -660,16 +781,20 @@ export async function issueCustomCertificate(data: {
   student_ids: string[]
   custom_title: string
   custom_reason?: string
-  cert_template?: "course_completion" | "academic_excellence" | "outstanding_achievement"
-}): Promise<{ created: number; certificates: unknown[] } | { error: string }> {
+  cert_template: "course_completion" | "academic_excellence" | "outstanding_achievement"
+}): Promise<{ created: number; certificates: AdminCertificate[] } | { error: string }> {
   return authFetch("/api/certificates/custom-issue", {
     method: "POST",
     body: JSON.stringify(data),
-  }) as never
+  }) as Promise<{ created: number; certificates: AdminCertificate[] } | { error: string }>
 }
 
-export async function revokeCertificate(id: string): Promise<{ success: boolean } | { error: string }> {
-  return authFetch(`/api/certificates/${id}`, { method: "DELETE" }) as never
+// Revokes a certificate. It is kept and marked "Revoked" (with who/when/why in the audit log) — never deleted.
+export async function revokeCertificate(id: string, reason: string): Promise<{ success: boolean; revoked_at: string } | { error: string }> {
+  return authFetch(`/api/certificates/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  }) as Promise<{ success: boolean; revoked_at: string } | { error: string }>
 }
 
 export async function openCertPdf(certId: string): Promise<{ error: string } | null> {
@@ -726,31 +851,6 @@ export function downloadCertPDF(certId: string, studentName: string): void {
   document.body.removeChild(a)
 }
 
-export function bulkDownloadCerts(classId: string, moduleId: string): void {
-  fetch(`${BACKEND}/api/certificates/bulk-generate`, {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ class_id: classId, module_id: moduleId }),
-  })
-    .then(r => { if (!r.ok) throw new Error(`Server error ${r.status}`); return r.blob() })
-    .then(blob => {
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `Certificates_${moduleId}.zip`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      setTimeout(() => URL.revokeObjectURL(url), 60000)
-    })
-    .catch(err => alert(`Download failed: ${err.message}`))
-}
-
-export async function deleteCert(certId: string): Promise<{ success: boolean } | { error: string }> {
-  return authFetch(`/api/certificates/${certId}`, { method: "DELETE" }) as never
-}
-
 export async function getChallenges(): Promise<{
   challenges: Array<{
     _id: string; title: string; difficulty: "Easy" | "Medium" | "Hard"
@@ -779,7 +879,17 @@ export async function getTeacherDetail(teacherId: string): Promise<{
   return authFetch(`/api/school/teacher-detail/${teacherId}`) as never
 }
 
+export interface ClassHistoryLine {
+  class_label: string | null
+  class_deleted: boolean
+  from_date: string
+  to_date: string | null
+  end_reason: string | null
+  is_current: boolean
+}
+
 export async function getStudentDetail(studentId: string): Promise<{
+  class_history: ClassHistoryLine[]
   attendance_rate: number | null
   attendance_breakdown: { present: number; late: number; absent: number; total: number }
   last_active: string | null
@@ -788,6 +898,8 @@ export async function getStudentDetail(studentId: string): Promise<{
   modules_completed: number
   quizzes_attempted: number
   quiz_avg_score: number | null
+  counted_from?: string | null
+  counted_class_label?: string | null
 } | { error: string }> {
   return authFetch(`/api/school/student-detail/${studentId}`) as never
 }
@@ -816,6 +928,8 @@ export async function getStudentAttDetail(
   period: string; from: string; to: string
   summary: { total: number; present: number; late: number; absent: number; rate: number | null }
   records: Array<{ date: string; period: number; subject: string; status: string }>
+  counted_from?: string | null
+  counted_class_label?: string | null
 } | { error: string }> {
   let url = `/api/school/student-attendance-detail/${studentId}?period=${period}`
   if (period === "custom" && from && to) url += `&from=${from}&to=${to}`

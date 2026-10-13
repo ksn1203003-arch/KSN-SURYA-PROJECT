@@ -6,11 +6,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import mongoose, { type Document, type Model } from "mongoose"
 
+// "once"   — the default: consumed by the first download (PDFs, images, documents).
+// "stream" — videos only: reusable for the parts a <video> asks for while playing.
+//            Valid for 5 minutes after its last use and never longer than maxExpiresAt;
+//            stops working when the user signs out (tokenVersion).
+export type FileTokenKind = "once" | "stream"
+
 export interface IFileToken extends Document {
   token: string
   userId: string
   gridfsId: string
   expiresAt: Date
+  kind: FileTokenKind
+  tokenVersion?: number
+  maxExpiresAt?: Date
 }
 
 const schema = new mongoose.Schema<IFileToken>({
@@ -18,6 +27,9 @@ const schema = new mongoose.Schema<IFileToken>({
   userId:   { type: String, required: true },
   gridfsId: { type: String, required: true },
   expiresAt:{ type: Date, required: true },
+  kind:     { type: String, enum: ["once", "stream"], default: "once" },
+  tokenVersion: { type: Number },
+  maxExpiresAt: { type: Date },
 })
 
 schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 }) // MongoDB TTL auto-cleanup

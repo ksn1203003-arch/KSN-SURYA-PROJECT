@@ -49,6 +49,7 @@ function serializeUser(user: InstanceType<typeof User>) {
     phone:                user.phone,
     username:             user.username,
     role:                 user.role,
+    gender:               user.gender ?? null,
     school_id:            user.school_id?.toString() ?? null,
     class_id:             user.class_id?.toString() ?? null,
     is_active:            user.is_active,

@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { createContext, useContext, useEffect, useRef, useState, useCallback, type ReactNode } from "react"
 import { getCurrentUser, signOut as authSignOut, type UserProfile } from "@/lib/auth"
+import { clearSessionCaches } from "@/lib/sessionCaches"
 
 const BC_CHANNEL = "ts-auth"
 const bc = typeof window !== "undefined" && "BroadcastChannel" in window
@@ -29,16 +30,26 @@ const WARN_BEFORE_MS   = 60 * 1000        // show warning 60 s before logout
 // no cross-tab leakage, no stale deadline on a fresh open.
 const LOGOUT_DEADLINE_KEY = "ts_logout_at"
 
+// Set right before an idle/session-expired sign-out, read once by LoginPage to
+// show a one-time explanation, then cleared — never set for a manual sign-out.
+const SIGNOUT_REASON_KEY = "ts_signout_reason"
+
 const ACTIVITY_EVENTS = ["mousemove", "mousedown", "keydown", "scroll", "touchstart"] as const
 
 interface AuthContextValue {
-  user:             UserProfile | null
-  loading:          boolean
-  idleWarning:      boolean
-  signOut:          () => Promise<void>
-  refreshUser:      () => Promise<void>
-  setUserFromLogin: (u: UserProfile) => void
-  resetIdleTimer:   () => void
+  user:                      UserProfile | null
+  loading:                   boolean
+  idleWarning:                boolean
+  signOut:                    () => Promise<void>
+  refreshUser:                () => Promise<void>
+  setUserFromLogin:            (u: UserProfile) => void
+  resetIdleTimer:              () => void
+  // Call this when a data fetch comes back 401 while `user` is still set — the
+  // session died server-side (idle revocation, token_version bump from another
+  // tab, etc.) without this tab's own idle timer having fired yet. Ensures the
+  // user sees a clear "session expired" explanation instead of a page that
+  // silently renders as if their account has no data.
+  signOutDueToSessionExpired: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -58,11 +69,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (logoutTimerRef.current) { clearTimeout(logoutTimerRef.current); logoutTimerRef.current = null }
   }
 
-  const handleSignOut = useCallback(async (fromBroadcast = false) => {
+  const handleSignOut = useCallback(async (fromBroadcast = false, reason: "manual" | "idle" | "session-expired" = "manual") => {
     clearTimers()
     idleWarningRef.current = false
     setIdleWarning(false)
     sessionStorage.removeItem(LOGOUT_DEADLINE_KEY)
+    // Persisted (not cleared on sign-out) so the login page can show a one-time
+    // explanation after the redirect — otherwise an idle/session-expired logout
+    // looks identical to the user as "the app just logged me out for no reason."
+    if (reason !== "manual") {
+      try { sessionStorage.setItem(SIGNOUT_REASON_KEY, reason) } catch { /* ignore */ }
+    }
     await authSignOut().catch(() => {})
     loginSetRef.current = false
     // Clear all user-specific localStorage keys so PII does not persist after logout.
@@ -75,6 +92,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       )
       keysToRemove.forEach(k => localStorage.removeItem(k))
     } catch { /* ignore — storage may be unavailable in private browsing */ }
+    // In-memory request caches (e.g. the teacher's class list) must not leak to the next user
+    clearSessionCaches()
     setUser(null)
     // Notify other open tabs unless this sign-out was triggered by a broadcast message.
     // Two-channel strategy for maximum browser compatibility:
@@ -102,7 +121,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     warnTimerRef.current = setTimeout(() => {
       idleWarningRef.current = true
       setIdleWarning(true)
-      logoutTimerRef.current = setTimeout(() => handleSignOut(), WARN_BEFORE_MS)
+      logoutTimerRef.current = setTimeout(() => handleSignOut(false, "idle"), WARN_BEFORE_MS)
     }, IDLE_TIMEOUT_MS - WARN_BEFORE_MS)
   }, [handleSignOut])
 
@@ -114,12 +133,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const deadline = parseInt(raw, 10)
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
-      handleSignOut()
+      handleSignOut(false, "idle")
     } else if (remaining <= WARN_BEFORE_MS && !idleWarningRef.current) {
       clearTimers()
       idleWarningRef.current = true
       setIdleWarning(true)
-      logoutTimerRef.current = setTimeout(() => handleSignOut(), remaining)
+      logoutTimerRef.current = setTimeout(() => handleSignOut(false, "idle"), remaining)
     }
   }, [handleSignOut])
 
@@ -209,13 +228,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const setUserFromLogin = (u: UserProfile) => {
     loginSetRef.current = true
+    // A new sign-in in this tab must never see request caches from a previous user
+    clearSessionCaches()
     setUser(u)
   }
+
+  const signOut = useCallback(() => handleSignOut(false, "manual"), [handleSignOut])
+  const signOutDueToSessionExpired = useCallback(() => handleSignOut(false, "session-expired"), [handleSignOut])
 
   return (
     <AuthContext.Provider value={{
       user, loading, idleWarning,
-      signOut: handleSignOut, refreshUser, setUserFromLogin, resetIdleTimer,
+      signOut, signOutDueToSessionExpired, refreshUser, setUserFromLogin, resetIdleTimer,
     }}>
       {children}
     </AuthContext.Provider>

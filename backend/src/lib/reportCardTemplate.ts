@@ -13,6 +13,22 @@ export interface ReportCardTemplateData {
   exams:       IExamDefinition[]
   resultMap:   Record<string, Record<string, { marks_obtained: number | null; is_absent: boolean }>>
   attPct:      number | null
+  // The class's stored school-year start (YYYY-MM-DD) when attendance was counted from it; null/absent = every sheet
+  // was counted. The page says "Attendance (from <date>)" so the figure is never read as the whole history.
+  countedFrom?:       string | null
+  countedClassLabel?: string | null
+}
+
+const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// "2026-08-01" -> "1 Aug 2026" (string work only, so no time-zone shift); anything else -> null
+function formatCountedFrom(ymd: string | null | undefined): string | null {
+  if (typeof ymd !== "string") return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd)
+  if (!m) return null
+  const month = Number(m[2])
+  if (month < 1 || month > 12) return null
+  return `${Number(m[3])} ${SHORT_MONTHS[month - 1]} ${m[1]}`
 }
 
 function calcGrade(pct: number, scale: IGradeScale[]): string {
@@ -68,6 +84,8 @@ export function buildReportCardHTML(data: ReportCardTemplateData): string {
   const subjectHeaders    = allSubjectNames.map(n => `<th colspan="3">${esc(n)}</th>`).join("")
   const subjectSubHeaders = allSubjectNames.map(() => "<th>Marks</th><th>%</th><th>Grade</th>").join("")
   const attLabel = attPct !== null ? `${attPct}%` : "N/A"
+  const countedFromText = formatCountedFrom(data.countedFrom)
+  const attBoxLabel = countedFromText ? `Attendance (from ${countedFromText})` : "Attendance"
   const attClass = attPct !== null ? (attPct >= 75 ? "att-good" : attPct >= 50 ? "att-warn" : "att-bad") : ""
   const today    = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })
 
@@ -122,7 +140,7 @@ tr:nth-child(even) td{background:#fafafa}
   <div class="info-item"><div class="label">Student Name</div><div class="value">${esc(studentName)}</div></div>
   <div class="info-item"><div class="label">Class</div><div class="value">${esc(classLabel)}</div></div>
   <div class="info-item"><div class="label">Total Exams</div><div class="value">${exams.length}</div></div>
-  <div class="info-item"><div class="label">Attendance</div><div class="value ${attClass}">${attLabel}</div></div>
+  <div class="info-item"><div class="label">${attBoxLabel}</div><div class="value ${attClass}">${attLabel}</div></div>
 </div>
 
 ${exams.length === 0

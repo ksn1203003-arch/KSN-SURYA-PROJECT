@@ -1,8 +1,62 @@
 import { useState, useEffect, useRef } from "react"
 import { createPortal } from "react-dom"
-import * as XLSX from "xlsx"
-import { Loader2, Copy, CheckCircle, ChevronDown } from "lucide-react"
+import { withXlsx } from "@/lib/excel"
+import { Loader2, Copy, CheckCircle, ChevronDown, ChevronLeft, ChevronRight } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import type { BulkResult, BulkTeacherResult } from "./adminTypes"
+
+export const LIST_PAGE_SIZE = 25
+
+/**
+ * Shows `rows` 25 at a time. Goes back to the first page only when `resetKey` changes
+ * (a new search or filter); removing a row keeps the admin on the page they were on.
+ */
+export function usePagedRows<T>(rows: T[], resetKey: string, pageSize = LIST_PAGE_SIZE) {
+  const [page, setPage] = useState(1)
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize))
+  useEffect(() => { setPage(1) }, [resetKey])
+  const current = Math.min(page, pages)
+  const pageRows = rows.slice((current - 1) * pageSize, current * pageSize)
+  return { page: current, pages, setPage, pageRows, total: rows.length, pageSize }
+}
+
+/** Page controls shown under a table. `anchorId` is the table to bring back into view on a page change. */
+export function ListPager({ page, pages, setPage, total, pageSize, noun, anchorId }: {
+  page: number; pages: number; setPage: (p: number) => void; total: number; pageSize: number; noun: string; anchorId: string
+}) {
+  const first = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const last = Math.min(page * pageSize, total)
+  const go = (next: number) => {
+    if (next < 1 || next > pages) return
+    setPage(next)
+    const table = document.getElementById(anchorId)
+    if (!table) return
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    table.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" })
+    // Keyboard users continue from the top of the new page, not from the off-screen button
+    table.focus({ preventScroll: true })
+  }
+  // aria-disabled (not disabled) keeps keyboard focus on the button at the first/last page
+  const navButton = "h-10 sm:h-8 text-xs gap-1 aria-disabled:opacity-50 aria-disabled:cursor-not-allowed"
+  return (
+    <nav aria-label={`${noun} pages`} className="flex flex-wrap items-center justify-between gap-2 px-1 py-3">
+      <p className="text-xs text-muted-foreground" aria-live="polite">
+        {pages > 1 ? `Showing ${first}–${last} of ${total} ${noun}` : `${total} ${noun}`}
+      </p>
+      {pages > 1 && (
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" className={navButton} aria-disabled={page <= 1} onClick={() => go(page - 1)}>
+            <ChevronLeft className="w-3.5 h-3.5" /> Previous
+          </Button>
+          <span className="text-xs text-muted-foreground">Page {page} of {pages}</span>
+          <Button variant="outline" size="sm" className={navButton} aria-disabled={page >= pages} onClick={() => go(page + 1)}>
+            Next <ChevronRight className="w-3.5 h-3.5" />
+          </Button>
+        </div>
+      )}
+    </nav>
+  )
+}
 
 export function Modal({ children, onClose }: { children: React.ReactNode; onClose?: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -77,10 +131,12 @@ export function Spinner() {
 }
 
 export function downloadExcel(rows: Record<string, string>[], filename: string) {
-  const ws = XLSX.utils.json_to_sheet(rows)
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, "Credentials")
-  XLSX.writeFile(wb, filename)
+  withXlsx(filename, XLSX => {
+    const ws = XLSX.utils.json_to_sheet(rows)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, "Credentials")
+    XLSX.writeFile(wb, filename)
+  })
 }
 
 export function downloadStudentCredential(name: string, username: string, password: string) {
@@ -449,10 +505,9 @@ export function DonutChart({ total, maleCount, femaleCount, otherCount = 0 }: { 
 
 // ── Student avatar — DB photo > localStorage > gradient initials ──
 export function StudentAvatar({ name, color, size = 28, photoUrl }: { name: string; color?: string; size?: number; photoUrl?: string | null }) {
-  const photo = photoUrl ?? (() => {
-    try { return localStorage.getItem(`teachscript_avatar_${name.replace(/\s+/g, "_")}`) }
-    catch { return null }
-  })()
+  // Only a photo passed in: a picture saved on this device under a name could belong to
+  // a different student with the same name on a shared school computer
+  const photo = photoUrl ?? null
   const initials = name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()
   const bg = color ? `linear-gradient(135deg,${color},${color}bb)` : "linear-gradient(135deg,#534AB7,#7970D6)"
   return (
@@ -461,8 +516,8 @@ export function StudentAvatar({ name, color, size = 28, photoUrl }: { name: stri
       style={{ width: size, height: size, background: photo ? "transparent" : bg }}
     >
       {photo
-        ? <img src={photo} alt={name} className="w-full h-full object-cover" />
-        : <span className="text-white font-bold" style={{ fontSize: size * 0.36 }}>{initials}</span>
+        ? <img src={photo} alt="" className="w-full h-full object-cover" />
+        : <span aria-hidden="true" className="text-white font-bold" style={{ fontSize: size * 0.36 }}>{initials}</span>
       }
     </div>
   )

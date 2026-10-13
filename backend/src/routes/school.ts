@@ -5,6 +5,7 @@ import { logger } from "../lib/logger.js"
 // notifications, and announcement management.
 // ─────────────────────────────────────────────────────────────────────────────
 import { Router, type Response } from "express"
+import { rateLimit, type RateLimitInfo } from "express-rate-limit"
 import { requireAuth, type AuthRequest } from "../middleware/auth.js"
 import { User } from "../models/User.js"
 import { School } from "../models/School.js"
@@ -29,13 +30,216 @@ import { Notification } from "../models/Notification.js"
 import { NotifRead } from "../models/NotifRead.js"
 import { Attendance } from "../models/Attendance.js"
 import { AuditLog } from "../models/AuditLog.js"
+import { cleanClassName } from "../lib/className.js"
+import { PHOTO_VERSION_PROJECTION, photoPath } from "../lib/userPhoto.js"
+import { academicYearStartIST, todayIST as currentIstDate } from "../lib/dateHelpers.js"
+import { calculateAttendanceRate, attendanceDateFilter, countedFields, floorFrom, loadCountedClass } from "../lib/attendanceHelpers.js"
+import { StudentEnrollment, runInTransaction } from "../models/StudentEnrollment.js"
+import { SharedRateLimitStore } from "../lib/rateLimitStore.js"
 
 const router = Router()
 router.use(requireAuth)
 
+// ── Class year start: small date helpers (YYYY-MM-DD strings, IST, no time-zone surprises) ──
+const YMD_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+const MAX_DAYS_AHEAD = 60
+const MAX_YEARS_BACK = 2
+const REASON_MAX_LENGTH = 100
+const REASON_RAW_MAX_LENGTH = 400   // checked on the text as it arrives, before any cleaning
+const MAX_BULK_CLASSES = 200
+const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/
+
+// True only for a string that is exactly YYYY-MM-DD and a real calendar date.
+function isCalendarDate(value: string): boolean {
+  if (!YMD_PATTERN.test(value)) return false
+  const parsed = new Date(`${value}T00:00:00Z`)
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+}
+
+function isRealYmd(value: unknown): value is string {
+  return typeof value === "string" && isCalendarDate(value)
+}
+
+function addDaysYmd(ymd: string, days: number): string {
+  const d = new Date(`${ymd}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+
+// Same month and day, some years earlier (29 Feb falls back to 28 Feb).
+function subtractYearsYmd(ymd: string, years: number): string {
+  const candidate = `${String(Number(ymd.slice(0, 4)) - years).padStart(4, "0")}${ymd.slice(4)}`
+  return isCalendarDate(candidate) ? candidate : `${candidate.slice(0, 4)}-02-28`
+}
+
+// "2026-06-01" -> "1 Jun 2026"
+function formatYmd(ymd: string): string {
+  return `${Number(ymd.slice(8, 10))} ${MONTH_NAMES[Number(ymd.slice(5, 7)) - 1]} ${ymd.slice(0, 4)}`
+}
+
+// Cleans an optional free-text reason. A text longer than 400 characters as received is refused outright, before
+// anything is done to it. Otherwise it is Unicode-normalised, line breaks and tabs become spaces, invisible/control
+// characters are removed (except U+200C and U+200D, which are real joiners inside Persian and Indic words), and spaces
+// are collapsed. There is no minimum length; the cleaned text may be at most 100 characters.
+function cleanReason(raw: unknown): { text: string | null; tooLong: boolean } {
+  if (typeof raw !== "string") return { text: null, tooLong: false }
+  if (raw.length > REASON_RAW_MAX_LENGTH) return { text: null, tooLong: true }
+  const text = raw
+    .normalize("NFKC")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\p{C}/gu, (ch) => (ch === "‌" || ch === "‍" ? ch : ""))
+    .replace(/\s+/g, " ")
+    .trim()
+  if (text === "") return { text: null, tooLong: false }
+  return { text, tooLong: [...text].length > REASON_MAX_LENGTH }
+}
+
+const REASON_TOO_LONG: YearStartRefusal = { error: "Please keep the reason under 100 characters.", code: "reason_too_long" }
+const INVALID_DATE: YearStartRefusal = { error: "Enter a real date in the form YYYY-MM-DD.", code: "invalid_date" }
+const RATE_LIMITED_BODY: YearStartRefusal = { error: "Too many date changes. Please wait and try again.", code: "rate_limited" }
+
+interface YearStartRefusal { error: string; code: string }
+
+// Rule: not older than two years, not more than 60 days ahead (both measured from today in IST).
+function yearStartRangeRefusal(date: string, today: string): YearStartRefusal | null {
+  const floor = subtractYearsYmd(today, MAX_YEARS_BACK)
+  if (date < floor) return { code: "too_early", error: `Choose a date after ${formatYmd(floor)}.` }
+  const ceiling = addDaysYmd(today, MAX_DAYS_AHEAD)
+  if (date > ceiling) return { code: "too_far", error: `Choose a date on or before ${formatYmd(ceiling)}.` }
+  return null
+}
+
+// How many saved attendance sheets leave or enter the school year when the start moves from oldEffective to next.
+// Moving later: sheets dated from the old start up to (not including) the new start leave. Moving earlier: sheets dated
+// from the new start up to (not including) the old start enter. Counted as sheets, never deleted. The class is already
+// checked against the caller's school, and older sheets may carry no school_id, so the query uses the class only.
+async function sheetCounts(
+  classId: mongoose.Types.ObjectId, oldEffective: string, next: string,
+): Promise<{ leaving: number; entering: number }> {
+  if (next > oldEffective) {
+    return { leaving: await Attendance.countDocuments({ class_id: classId, date: { $gte: oldEffective, $lt: next } }), entering: 0 }
+  }
+  if (next < oldEffective) {
+    return { leaving: 0, entering: await Attendance.countDocuments({ class_id: classId, date: { $gte: next, $lt: oldEffective } }) }
+  }
+  return { leaving: 0, entering: 0 }
+}
+
+// Saves the new start date, the time it was set and its audit row together. The date is only written if it still
+// holds the value the caller checked ("conflict" otherwise). If the audit row cannot be written the date change is
+// undone (rolled back in a transaction; restored by hand on a standalone server) and the error is thrown.
+// `effective` is the start the sheet counts were made from (the stored date, or the default start of an older class);
+// it is written to the audit row next to the previous stored value.
+async function saveYearStart(a: {
+  classId: mongoose.Types.ObjectId; schoolId: mongoose.Types.ObjectId
+  previous: string | null; previousSetAt: Date | null; effective: string; next: string; reason: string | null
+  sheetsLeaving: number; sheetsEntering: number
+  actorId: string; actorRole: string; ip: string
+}): Promise<"saved" | "conflict"> {
+  return runInTransaction(async (session) => {
+    const written = await Class.updateOne(
+      { _id: a.classId, school_id: a.schoolId, year_start: a.previous },
+      { $set: { year_start: a.next, year_start_set_at: new Date() } },
+      { session },
+    )
+    if (written.matchedCount === 0) return "conflict" as const
+    try {
+      await AuditLog.create([{
+        school_id:     a.schoolId,
+        actor_id:      new mongoose.Types.ObjectId(a.actorId),
+        actor_role:    a.actorRole,
+        action:        "class.year_start_changed",
+        resource_type: "Class",
+        resource_id:   a.classId.toString(),
+        before:        { year_start: a.previous, effective: a.effective },
+        after:         { year_start: a.next, reason: a.reason, sheets_leaving: a.sheetsLeaving, sheets_entering: a.sheetsEntering },
+        ip:            a.ip,
+        timestamp:     new Date(),
+      }], { session })
+    } catch (auditErr) {
+      if (!session) {
+        // Standalone server: nothing rolls back by itself, so put the old value back before refusing.
+        await Class.updateOne(
+          { _id: a.classId, school_id: a.schoolId, year_start: a.next },
+          { $set: { year_start: a.previous, year_start_set_at: a.previousSetAt } },
+        )
+      }
+      throw auditErr
+    }
+    return "saved" as const
+  })
+}
+
+// Per-admin limits on start-date changes. They are mounted on the routes below (after requireAuth, so the key is the
+// signed-in admin, not the school's shared network address). A request is counted when it arrives and STAYS counted
+// (even if the client hangs up while the change is being saved). The handler itself gives the hit back, through
+// giveBackHit() below, only when the server refused the request or the request changed nothing. A PATCH that sends
+// no year_start (name/subjects only) is not counted at all (skip). The stores are created once here so the handlers
+// can reach the very same counters the limiters use.
+const yearStartStore = new SharedRateLimitStore("class-year-start")
+const yearStartBulkStore = new SharedRateLimitStore("class-year-start-bulk")
+
+// The counter key of a request: the signed-in admin (the same key the limiters count under).
+function yearStartLimitKey(req: AuthRequest): string {
+  return req.userId ?? req.ip ?? "unknown"
+}
+
+const yearStartLimit = rateLimit({
+  windowMs: 60 * 60_000, max: 10,
+  keyGenerator: (req) => yearStartLimitKey(req as AuthRequest),
+  skip: (req) => (req.body as { year_start?: unknown } | undefined)?.year_start === undefined,
+  standardHeaders: true, legacyHeaders: false,
+  store: yearStartStore,
+  handler: (_req, res) => { res.status(429).json(RATE_LIMITED_BODY) },
+})
+const yearStartBulkLimit = rateLimit({
+  windowMs: 60 * 60_000, max: 3,
+  keyGenerator: (req) => yearStartLimitKey(req as AuthRequest),
+  standardHeaders: true, legacyHeaders: false,
+  store: yearStartBulkStore,
+  handler: (_req, res) => { res.status(429).json(RATE_LIMITED_BODY) },
+})
+
+// Requests whose hit has already been given back (a request gives its hit back at most once).
+const hitsGivenBack = new WeakSet<object>()
+
+// Gives this request's hit back to the limiter's counter. Nothing happens when the request was not counted (no
+// req.rateLimit: the limiter skipped it), when the hit was already given back, or when the hour it was counted in has
+// already ended. Called by a handler only for a server refusal or a request that changed nothing; it never looks at
+// whether the client is still connected.
+async function giveBackHit(req: AuthRequest, store: SharedRateLimitStore): Promise<void> {
+  if (hitsGivenBack.has(req)) return
+  hitsGivenBack.add(req)
+  const counted = (req as AuthRequest & { rateLimit?: RateLimitInfo }).rateLimit
+  if (counted === undefined) return
+  if (counted.resetTime !== undefined && counted.resetTime.getTime() <= Date.now()) return
+  try {
+    await store.decrement(yearStartLimitKey(req))
+  } catch (err) {
+    logger.warn({ err }, "[school year start] could not give a counted request back")
+  }
+}
+
+// Name of a class as the admin screens show it.
+function liveClassLabel(c: { grade: number; section: string; name?: string | null }): string {
+  return c.grade > 0 ? `Class ${c.grade}${c.section}` : (c.name ?? c.section)
+}
+
 // Resolve caller's school_id and verify admin role.
 // requireAuth middleware (already applied above) sets req.userRole and req.schoolId,
 // so no extra DB query is needed here.
+// Shapes of the people lists — the photo itself is never read, only its version.
+interface ListedTeacher {
+  _id: mongoose.Types.ObjectId; name: string; email: string; phone: string | null
+  is_active: boolean; created_at?: Date; photo_v: number | null
+}
+interface ListedStudent {
+  _id: mongoose.Types.ObjectId; name: string; email?: string; phone?: string | null
+  username: string | null; gender?: string | null; class_id?: mongoose.Types.ObjectId | null
+  is_active: boolean; points?: number; created_at?: Date; photo_v: number | null
+}
+
 function adminSchool(req: AuthRequest): { schoolId: string } | { error: string; status: number } {
   if (!["admin", "super_admin"].includes(req.userRole ?? "")) return { error: "Admin access required", status: 403 }
   if (!req.schoolId) return { error: "No school associated with this account", status: 400 }
@@ -103,16 +307,21 @@ router.get("/classes", async (req: AuthRequest, res: Response) => {
     if (cid) countMap[cid] = (countMap[cid] ?? 0) + 1
   }
 
+  const defaultYearStart = academicYearStartIST()
   res.json({
     classes: classes.map(c => {
       const cid = (c._id as { toString(): string }).toString()
       const tid = c.teacher_id?.toString() ?? null
+      const storedStart = typeof c.year_start === "string" ? c.year_start : null
       return {
         id: cid,
         grade: c.grade,
         section: c.section,
         name: c.name ?? null,
         subjects: c.subjects ?? [],
+        year_start: storedStart,
+        year_start_effective: storedStart ?? defaultYearStart,
+        has_start_date: storedStart !== null,
         timetable: (c.timetable ?? []).map(slot => ({
           day: slot.day, period: slot.period, subject: slot.subject,
           teacher_id: slot.teacher_id?.toString() ?? null,
@@ -152,16 +361,25 @@ router.post("/classes", async (req: AuthRequest, res: Response) => {
     const ctx = adminSchool(req)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
-    const { name, subjects } = req.body as { name: string; subjects?: string[] }
-    if (!name?.trim()) { res.status(400).json({ error: "Class name is required" }); return }
-    const label = name.trim()
-    if (label.length > 100) { res.status(400).json({ error: "Class name must be under 100 characters" }); return }
+    const { name, subjects, year_start } = req.body as { name: string; subjects?: string[]; year_start?: unknown }
+    const cleaned = cleanClassName(name)
+    if (!cleaned.ok) { res.status(400).json({ error: cleaned.error }); return }
+    const label = cleaned.value
     if (subjects !== undefined) {
       if (!Array.isArray(subjects)) { res.status(400).json({ error: "subjects must be an array" }); return }
       if (subjects.length > 20) { res.status(400).json({ error: "A class can have at most 20 subjects" }); return }
       if (subjects.some(s => typeof s !== "string" || s.trim().length > 50)) {
         res.status(400).json({ error: "Each subject must be a string under 50 characters" }); return
       }
+    }
+
+    // The year start is stored on the class: the date sent (strictly checked) or the start of the current academic year.
+    let startDate = academicYearStartIST()
+    if (year_start !== undefined) {
+      if (!isRealYmd(year_start)) { res.status(400).json(INVALID_DATE); return }
+      const outOfRange = yearStartRangeRefusal(year_start, currentIstDate())
+      if (outOfRange) { res.status(400).json(outOfRange); return }
+      startDate = year_start
     }
 
     try {
@@ -171,8 +389,13 @@ router.post("/classes", async (req: AuthRequest, res: Response) => {
         section: label.toUpperCase(),
         name: label,
         subjects: subjects?.filter((s: string) => s.trim()) ?? [],
+        year_start: startDate,
+        year_start_set_at: new Date(),
       })
-      res.json({ class: { id: (cls._id as { toString(): string }).toString(), grade: cls.grade, section: cls.section, name: cls.name, subjects: cls.subjects } })
+      res.json({ class: {
+        id: (cls._id as { toString(): string }).toString(), grade: cls.grade, section: cls.section, name: cls.name, subjects: cls.subjects,
+        year_start: startDate, year_start_effective: startDate,
+      } })
     } catch (err) {
       if (err instanceof Error && err.message.includes("duplicate key")) {
         res.status(400).json({ error: `A class named "${label}" already exists in this school.` }); return
@@ -186,32 +409,240 @@ router.post("/classes", async (req: AuthRequest, res: Response) => {
 })
 
 // ── PATCH /api/school/classes/:id ────────────────────────────────────────────
-router.patch("/classes/:id", async (req: AuthRequest, res: Response) => {
+// Changes the name, the subjects and/or the school-year start. A request that sends a start date counts against a
+// limit of 10 per hour per admin. The hit is given back only when the server answers 4xx (nothing was saved) or the
+// date sent is the date already stored (nothing changed); a 500, a 429 and a request whose client hung up while the
+// change was saved stay counted.
+router.patch("/classes/:id", yearStartLimit, async (req: AuthRequest, res: Response) => {
+  // Answers with a refusal and gives the counted hit back first, so the next request already sees the free hit.
+  const refuse = async (status: number, body: object): Promise<void> => {
+    await giveBackHit(req, yearStartStore)
+    res.status(status).json(body)
+  }
+  try {
+    const ctx = adminSchool(req)
+    if ("error" in ctx) { await refuse(ctx.status, { error: ctx.error }); return }
+
+    if (!mongoose.isValidObjectId(req.params.id)) { await refuse(400, { error: "Invalid class id" }); return }
+
+    const { name, subjects, year_start, expected_current, reason } = req.body as {
+      name?: string; subjects?: string[]; year_start?: unknown; expected_current?: unknown; reason?: unknown
+    }
+    if (subjects !== undefined) {
+      if (!Array.isArray(subjects)) { await refuse(400, { error: "subjects must be an array" }); return }
+      if (subjects.length > 20) { await refuse(400, { error: "A class can have at most 20 subjects" }); return }
+      if (subjects.some(s => typeof s !== "string" || s.trim().length > 50)) {
+        await refuse(400, { error: "Each subject must be a string under 50 characters" }); return
+      }
+    }
+    const cls = await Class.findOne({ _id: req.params.id, school_id: ctx.schoolId })
+    if (!cls) { await refuse(404, { error: "Class not found" }); return }
+
+    // ── Year start: every check runs BEFORE anything is saved, so a refusal changes nothing (not even the name). ──
+    const storedStart = typeof cls.year_start === "string" ? cls.year_start : null
+    const effectiveStored = storedStart ?? academicYearStartIST()   // the date the admin list shows for this class
+    let newStart: string | null = null   // set only when the date really changes
+    let newStartReason: string | null = null
+    let counts = { leaving: 0, entering: 0 }
+    if (year_start !== undefined) {
+      // 1. strict YYYY-MM-DD, a real date (null, "", numbers, arrays and objects are all refused)
+      if (!isRealYmd(year_start)) { await refuse(400, INVALID_DATE); return }
+      // 2. the caller must have seen the date that is current: what is stored, or (for an older class with nothing
+      // stored) the default start the list shows; missing/null = "nothing stored"
+      const sent = expected_current ?? null
+      if (sent !== storedStart && sent !== effectiveStored) {
+        await refuse(409, {
+          error: `Someone else just changed this date to ${formatYmd(effectiveStored)}. Nothing was saved. Check the new date and try again.`,
+          code: "conflict", year_start: storedStart, year_start_effective: effectiveStored,
+        }); return
+      }
+      // 3. the same date again changes nothing (and gives its counted hit back when the answer is sent)
+      if (year_start !== storedStart) {
+        const today = currentIstDate()
+        // 4. not older than two years, not more than 60 days ahead
+        const outOfRange = yearStartRangeRefusal(year_start, today)
+        if (outOfRange) { await refuse(400, outOfRange); return }
+        // 5. the reason is optional; a text over 400 characters is refused as it arrives, otherwise it is cleaned once
+        // and may be at most 100 characters
+        const cleaned = cleanReason(reason)
+        if (cleaned.tooLong) { await refuse(400, REASON_TOO_LONG); return }
+        // 6. any date in range is accepted, with or without saved attendance; no sheet is ever deleted, and the answer
+        // says how many saved sheets leave or enter the school year
+        counts = await sheetCounts(cls._id, effectiveStored, year_start)
+        newStart = year_start
+        newStartReason = cleaned.text
+      }
+    }
+
+    // Only a changed name is checked, so a class named long ago (before the rule) stays editable.
+    let cleanedName: string | null | undefined
+    if (name !== undefined && (typeof name !== "string" || name.trim() !== (cls.name ?? ""))) {
+      if (typeof name === "string" && name.trim() === "") {
+        cleanedName = null   // clearing the custom name is allowed
+      } else {
+        const cleaned = cleanClassName(name)
+        if (!cleaned.ok) { await refuse(400, { error: cleaned.error }); return }
+        cleanedName = cleaned.value
+      }
+    }
+
+    // Apply the date first (one conditional write + its audit row); a refusal here saves nothing at all.
+    if (newStart !== null) {
+      let outcome: "saved" | "conflict"
+      try {
+        outcome = await saveYearStart({
+          classId: cls._id, schoolId: cls.school_id,
+          previous: storedStart, previousSetAt: cls.year_start_set_at ?? null, effective: effectiveStored, next: newStart,
+          reason: newStartReason, sheetsLeaving: counts.leaving, sheetsEntering: counts.entering,
+          actorId: req.userId!, actorRole: req.userRole ?? "admin", ip: req.ip ?? "",
+        })
+      } catch (saveErr) {
+        logger.error({ err: saveErr }, "[school/classes PATCH] could not save the year start date")
+        res.status(500).json({ error: "Could not save. Please try again." }); return
+      }
+      if (outcome === "conflict") {
+        // Someone saved a different date between our check and our write: tell the caller what is stored now.
+        const latest = await Class.findOne({ _id: cls._id, school_id: cls.school_id }).select("year_start").lean<{ year_start?: string | null } | null>()
+        const nowStored = typeof latest?.year_start === "string" ? latest.year_start : null
+        await refuse(409, {
+          error: `Someone else just changed this date to ${formatYmd(nowStored ?? academicYearStartIST())}. Nothing was saved. Check the new date and try again.`,
+          code: "conflict", year_start: nowStored, year_start_effective: nowStored ?? academicYearStartIST(),
+        }); return
+      }
+    }
+
+    if (cleanedName !== undefined) cls.name = cleanedName
+    if (subjects !== undefined) cls.subjects = subjects.filter(s => s.trim())
+    await cls.save()
+    // A date was sent but it is the date already stored: nothing changed, so the counted hit is given back.
+    if (year_start !== undefined && newStart === null) await giveBackHit(req, yearStartStore)
+    const finalStart = newStart ?? storedStart
+    res.json({
+      success: true, name: cls.name, subjects: cls.subjects,
+      year_start: finalStart, year_start_effective: finalStart ?? academicYearStartIST(),
+      sheets_leaving: counts.leaving, sheets_entering: counts.entering,
+    })
+  } catch (err) {
+    logger.error({ err: err }, "[school/classes PATCH]")
+    res.status(500).json({ error: "Failed to update class" })
+  }
+})
+
+// ── GET /api/school/classes/:id/year-start-preview?date= ─────────────────────
+// Shows what a start-date change would do (how many saved sheets leave or enter the school year) and writes nothing.
+router.get("/classes/:id/year-start-preview", async (req: AuthRequest, res: Response) => {
   try {
     const ctx = adminSchool(req)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
-    const { name, subjects } = req.body as { name?: string; subjects?: string[] }
-    if (name !== undefined && name.trim().length > 100) {
-      res.status(400).json({ error: "Class name must be under 100 characters" }); return
-    }
-    if (subjects !== undefined) {
-      if (!Array.isArray(subjects)) { res.status(400).json({ error: "subjects must be an array" }); return }
-      if (subjects.length > 20) { res.status(400).json({ error: "A class can have at most 20 subjects" }); return }
-      if (subjects.some(s => typeof s !== "string" || s.trim().length > 50)) {
-        res.status(400).json({ error: "Each subject must be a string under 50 characters" }); return
-      }
-    }
-    const cls = await Class.findOne({ _id: req.params.id, school_id: ctx.schoolId })
+    if (!validateObjectId(req.params.id, res, "class id")) return
+
+    const cls = await Class.findOne({ _id: req.params.id, school_id: ctx.schoolId }).select("year_start").lean<{ _id: mongoose.Types.ObjectId; year_start?: string | null } | null>()
     if (!cls) { res.status(404).json({ error: "Class not found" }); return }
 
-    if (name !== undefined) cls.name = name?.trim() || null
-    if (subjects !== undefined) cls.subjects = subjects.filter(s => s.trim())
-    await cls.save()
-    res.json({ success: true, name: cls.name, subjects: cls.subjects })
+    const date = req.query.date
+    if (!isRealYmd(date)) { res.status(400).json(INVALID_DATE); return }
+    const outOfRange = yearStartRangeRefusal(date, currentIstDate())
+    if (outOfRange) { res.status(400).json(outOfRange); return }
+
+    const current = typeof cls.year_start === "string" ? cls.year_start : academicYearStartIST()
+    const counts = await sheetCounts(cls._id, current, date)
+    res.json({ current, date, sheets_leaving: counts.leaving, sheets_entering: counts.entering })
   } catch (err) {
-    logger.error({ err: err }, "[school/classes PATCH]")
-    res.status(500).json({ error: "Failed to update class" })
+    logger.error({ err: err }, "[school/classes year-start-preview GET]")
+    res.status(500).json({ error: "Failed to load the preview" })
+  }
+})
+
+// ── POST /api/school/classes-year-start ──────────────────────────────────────
+// Sets the school-year start of up to 200 classes in one call. The request is checked as a whole first (400, nothing
+// touched); then every class is handled on its own (own transaction, own audit row) and gets its own status:
+// saved | unchanged | skipped_has_date | conflict | not_found | error. A class that already has a stored start is
+// skipped unless include_dated is exactly true. A class id sent more than once is handled once (the first entry's
+// expected_current is used). At most 3 calls per hour per admin; the hit is given back when the whole request is
+// refused with 400 or when no class was saved (updated is 0), and stays counted otherwise (also when the client
+// hangs up while the changes are being saved).
+router.post("/classes-year-start", yearStartBulkLimit, async (req: AuthRequest, res: Response) => {
+  // Answers a whole-request 400 and gives the counted hit back first.
+  const refuse = async (body: object): Promise<void> => {
+    await giveBackHit(req, yearStartBulkStore)
+    res.status(400).json(body)
+  }
+  try {
+    const ctx = adminSchool(req)
+    if ("error" in ctx) {
+      if (ctx.status === 400) { await refuse({ error: ctx.error }); return }
+      res.status(ctx.status).json({ error: ctx.error }); return
+    }
+
+    const { year_start, classes, include_dated, reason } = req.body as {
+      year_start?: unknown; classes?: unknown; include_dated?: unknown; reason?: unknown
+    }
+    // The 200 limit counts the entries received, duplicates included.
+    if (!Array.isArray(classes) || classes.length < 1 || classes.length > MAX_BULK_CLASSES) {
+      await refuse({ error: `Send between 1 and ${MAX_BULK_CLASSES} classes.` }); return
+    }
+    const wanted: Array<{ id: string; expected: unknown }> = []
+    const seenIds = new Set<string>()
+    for (const item of classes as unknown[]) {
+      const entry = item as { id?: unknown; expected_current?: unknown } | null
+      if (entry === null || typeof entry !== "object" || typeof entry.id !== "string" || !OBJECT_ID_PATTERN.test(entry.id)) {
+        await refuse({ error: "Every class needs a valid id." }); return
+      }
+      const idKey = entry.id.toLowerCase()
+      if (seenIds.has(idKey)) continue   // a repeated id is handled once, with the first entry's expected_current
+      seenIds.add(idKey)
+      wanted.push({ id: entry.id, expected: entry.expected_current ?? null })
+    }
+    if (!isRealYmd(year_start)) { await refuse(INVALID_DATE); return }
+    const outOfRange = yearStartRangeRefusal(year_start, currentIstDate())
+    if (outOfRange) { await refuse(outOfRange); return }
+    const cleaned = cleanReason(reason)
+    if (cleaned.tooLong) { await refuse(REASON_TOO_LONG); return }
+
+    const schoolObjectId = new mongoose.Types.ObjectId(ctx.schoolId)
+    const results: Array<{ id: string; status: string; year_start?: string | null }> = []
+    let updated = 0
+    for (const item of wanted) {
+      try {
+        // A class of another school answers exactly like one that does not exist.
+        const cls = await Class.findOne({ _id: item.id, school_id: schoolObjectId }).select("year_start year_start_set_at")
+        if (!cls) { results.push({ id: item.id, status: "not_found" }); continue }
+        const storedStart = typeof cls.year_start === "string" ? cls.year_start : null
+        const effectiveStored = storedStart ?? academicYearStartIST()
+        if (storedStart !== null && include_dated !== true) {
+          results.push({ id: item.id, status: "skipped_has_date", year_start: storedStart }); continue
+        }
+        if (item.expected !== storedStart && item.expected !== effectiveStored) {
+          results.push({ id: item.id, status: "conflict", year_start: storedStart }); continue
+        }
+        if (year_start === storedStart) {
+          results.push({ id: item.id, status: "unchanged", year_start: storedStart }); continue
+        }
+        const counts = await sheetCounts(cls._id, effectiveStored, year_start)
+        const outcome = await saveYearStart({
+          classId: cls._id, schoolId: schoolObjectId,
+          previous: storedStart, previousSetAt: cls.year_start_set_at ?? null, effective: effectiveStored, next: year_start,
+          reason: cleaned.text, sheetsLeaving: counts.leaving, sheetsEntering: counts.entering,
+          actorId: req.userId!, actorRole: req.userRole ?? "admin", ip: req.ip ?? "",
+        })
+        if (outcome === "saved") {
+          updated += 1
+          results.push({ id: item.id, status: "saved", year_start })
+        } else {
+          results.push({ id: item.id, status: "conflict" })
+        }
+      } catch (itemErr) {
+        logger.error({ err: itemErr }, "[school/classes-year-start POST] could not save one class")
+        results.push({ id: item.id, status: "error" })
+      }
+    }
+    // Nothing was saved (every class was skipped, unchanged, in conflict, not found or failed): the hit is given back.
+    if (updated === 0) await giveBackHit(req, yearStartBulkStore)
+    res.json({ results, updated })
+  } catch (err) {
+    logger.error({ err: err }, "[school/classes-year-start POST]")
+    res.status(500).json({ error: "Could not save. Please try again." })
   }
 })
 
@@ -416,7 +847,7 @@ router.get("/teachers", async (req: AuthRequest, res: Response) => {
     const skip  = (page - 1) * limit
 
     const [teachers, classes, total] = await Promise.all([
-      User.find({ school_id: ctx.schoolId, role: "teacher" }).select("name email phone is_active profile_photo_url created_at").sort("name").skip(skip).limit(limit).lean(),
+      User.find({ school_id: ctx.schoolId, role: "teacher" }).select({ name: 1, email: 1, phone: 1, is_active: 1, created_at: 1, ...PHOTO_VERSION_PROJECTION }).sort({ name: 1, _id: 1 }).skip(skip).limit(limit).lean<ListedTeacher[]>(),
       Class.find({ school_id: ctx.schoolId }).select("grade section name teacher_id teachers").lean(),
       User.countDocuments({ school_id: ctx.schoolId, role: "teacher" }),
     ])
@@ -447,8 +878,8 @@ router.get("/teachers", async (req: AuthRequest, res: Response) => {
         email: t.email,
         phone: t.phone,
         is_active: t.is_active,
-        profile_photo_url: (t as unknown as { profile_photo_url?: string }).profile_photo_url ?? null,
-        created_at: (t as unknown as { created_at?: Date }).created_at ?? null,
+        photo_url: t.is_active ? photoPath(tid, t.photo_v) : null,
+        created_at: t.created_at ?? null,
         class_label: primaryClassMap[tid] ?? null,
         subject_assignments: subjectMap[tid] ?? [],
       }
@@ -468,14 +899,20 @@ router.get("/students", async (req: AuthRequest, res: Response) => {
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
     const filter: Record<string, unknown> = { school_id: ctx.schoolId, role: "student" }
-    if (req.query.class_id) filter.class_id = req.query.class_id as string
+    if (req.query.class_id !== undefined) {
+      const classId = req.query.class_id
+      if (typeof classId !== "string" || !mongoose.isValidObjectId(classId)) {
+        res.status(400).json({ error: "Invalid class_id" }); return
+      }
+      filter.class_id = classId
+    }
 
     const page  = Math.max(1, parseInt(req.query.page  as string) || 1)
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string) || 50))
     const skip  = (page - 1) * limit
 
     const [students, classes, total] = await Promise.all([
-      User.find(filter).select("name email phone username gender class_id is_active profile_photo_url points created_at").sort("name").skip(skip).limit(limit).lean(),
+      User.find(filter).select({ name: 1, email: 1, phone: 1, username: 1, gender: 1, class_id: 1, is_active: 1, points: 1, created_at: 1, ...PHOTO_VERSION_PROJECTION }).sort({ name: 1, _id: 1 }).skip(skip).limit(limit).lean<ListedStudent[]>(),
       Class.find({ school_id: ctx.schoolId }).select("grade section name").lean(),
       User.countDocuments(filter),
     ])
@@ -485,8 +922,9 @@ router.get("/students", async (req: AuthRequest, res: Response) => {
   res.json({
     students: students.map(s => {
       const cid = s.class_id?.toString() ?? null
+      const sid = s._id.toString()
       return {
-        id: (s._id as { toString(): string }).toString(),
+        id: sid,
         name: s.name,
         email: s.email,
         phone: s.phone ?? null,
@@ -495,9 +933,9 @@ router.get("/students", async (req: AuthRequest, res: Response) => {
         class_id: cid,
         class_label: cid ? (classMap[cid] ?? null) : null,
         is_active: s.is_active,
-        profile_photo_url: s.profile_photo_url ?? null,
-        points: (s as unknown as { points?: number }).points ?? 0,
-        created_at: (s as unknown as { created_at?: Date }).created_at ?? null,
+        photo_url: s.is_active ? photoPath(sid, s.photo_v) : null,
+        points: s.points ?? 0,
+        created_at: s.created_at ?? null,
       }
     }),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) },
@@ -569,7 +1007,9 @@ router.get("/student-detail/:id", async (req: AuthRequest, res: Response) => {
     const ctx = adminSchool(req)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
-    const studentId = new mongoose.Types.ObjectId(String(req.params.id))
+    const rawStudentId = String(req.params.id)
+    if (!/^[0-9a-fA-F]{24}$/.test(rawStudentId)) { res.status(400).json({ error: "Invalid student id" }); return }
+    const studentId = new mongoose.Types.ObjectId(rawStudentId)
     const student = await User.findOne({ _id: studentId, school_id: ctx.schoolId, role: "student" }).select("name class_id").lean()
     if (!student) { res.status(404).json({ error: "Student not found" }); return }
 
@@ -582,10 +1022,12 @@ router.get("/student-detail/:id", async (req: AuthRequest, res: Response) => {
       ModuleProgress.find({ student_id: studentId }).select("module_id").lean(),
     ])
 
-    // Attendance: pull all attendance records for this student's class
+    // Attendance: the student's class is looked up inside this school; only its sheets dated on/after the class's
+    // stored school-year start count (no stored date = every sheet). A class not found in the school counts nothing.
     let present = 0, late = 0, absent = 0
-    if (student.class_id) {
-      const records = await Attendance.find({ class_id: student.class_id }).select("records").lean()
+    const counted = student.class_id ? await loadCountedClass(student.class_id, schoolObjId) : null
+    if (student.class_id && counted) {
+      const records = await Attendance.find({ class_id: student.class_id, ...attendanceDateFilter(counted.start) }).select("records").lean()
       for (const rec of records) {
         const studentRec = rec.records?.find(r => r.student_id?.toString() === studentId.toString())
         if (studentRec) {
@@ -596,16 +1038,47 @@ router.get("/student-detail/:id", async (req: AuthRequest, res: Response) => {
       }
     }
     const total = present + late + absent
-    const attendance_rate = total > 0 ? Math.round(((present + late * 0.5) / total) * 100) : null
+    const attendance_rate = calculateAttendanceRate(present, late, total)
 
     const modules_completed = new Set(moduleProgressRecords.map(r => (r as unknown as { module_id: { toString(): string } }).module_id?.toString())).size
     const quiz_avg = quizAttempts.length > 0
       ? Math.round(quizAttempts.reduce((sum, a) => sum + ((a as unknown as { percentage: number }).percentage ?? 0), 0) / quizAttempts.length)
       : null
 
+    // Class history: this student's lines in this school, the newest 50 lines, oldest first. Ids never leave the server.
+    interface HistoryRow {
+      class_id: mongoose.Types.ObjectId; class_label?: string | null
+      from_date: string; to_date?: string | null; end_reason?: string | null; is_current: boolean
+    }
+    const newestHistoryRows = await StudentEnrollment.find({ school_id: schoolObjId, student_id: studentId })
+      .sort({ from_date: -1, _id: -1 }).limit(50)
+      .select("class_id class_label from_date to_date end_reason is_current")
+      .lean<HistoryRow[]>()
+    const historyRows = [...newestHistoryRows].reverse()
+    const historyClassIds = [...new Set(historyRows.map(l => l.class_id.toString()))].map(id => new mongoose.Types.ObjectId(id))
+    const liveClasses = historyClassIds.length
+      ? await Class.find({ _id: { $in: historyClassIds }, school_id: schoolObjId }).select("grade section name").lean()
+      : []
+    const liveLabels = new Map<string, string>()
+    for (const c of liveClasses) liveLabels.set(String(c._id), liveClassLabel(c))
+    const class_history = historyRows.map(l => {
+      const classId = l.class_id.toString()
+      return {
+        // the current line shows the class's live name; a closed line keeps the name it had then
+        class_label: (l.is_current ? (liveLabels.get(classId) ?? l.class_label) : (l.class_label ?? liveLabels.get(classId))) ?? null,
+        class_deleted: !liveLabels.has(classId),
+        from_date: l.from_date,
+        to_date: l.to_date ?? null,
+        end_reason: l.end_reason ?? null,
+        is_current: l.is_current,
+      }
+    })
+
     res.json({
+      class_history,
       attendance_rate,
       attendance_breakdown: { present, late, absent, total },
+      ...countedFields(counted),
       last_active: lastActivity ? (lastActivity as unknown as { date: string }).date : null,
       minutes_active_last_day: lastActivity ? (lastActivity as unknown as { minutes_active: number }).minutes_active : 0,
       certificates_count: certificatesCount,
@@ -698,20 +1171,25 @@ router.get("/student-attendance-detail/:id", async (req: AuthRequest, res: Respo
     const ctx = adminSchool(req)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
-    const studentId = new mongoose.Types.ObjectId(String(req.params.id))
+    const rawStudentId = String(req.params.id)
+    if (!/^[0-9a-fA-F]{24}$/.test(rawStudentId)) { res.status(400).json({ error: "Invalid student id" }); return }
+    const studentId = new mongoose.Types.ObjectId(rawStudentId)
     const student = await User.findOne({ _id: studentId, school_id: ctx.schoolId, role: "student" }).select("class_id").lean()
     if (!student) { res.status(404).json({ error: "Student not found" }); return }
 
     const period = (req.query.period as string) || "month"
     const { from, to } = periodDateRange(period, req.query.from as string, req.query.to as string)
 
-    if (!student.class_id) {
-      res.json({ period, from, to, summary: { total: 0, present: 0, late: 0, absent: 0, rate: null }, records: [] }); return
+    // The student's class is looked up inside this school. No class, or a class not found in the school: empty figures.
+    const counted = student.class_id ? await loadCountedClass(student.class_id, new mongoose.Types.ObjectId(ctx.schoolId)) : null
+    if (!student.class_id || !counted) {
+      res.json({ period, from, to, summary: { total: 0, present: 0, late: 0, absent: 0, rate: null }, records: [], ...countedFields(null) }); return
     }
 
+    // The requested range is clamped to the class's stored school-year start: earlier sheets are never counted.
     const docs = await Attendance.find({
       class_id: student.class_id,
-      date: { $gte: from, $lte: to },
+      ...attendanceDateFilter(counted.start, floorFrom(counted.start, from), to),
     }).sort({ date: 1, period: 1 }).select("date period subject records").lean()
 
     type AttDoc = { date: string; period: number; subject: string; records: Array<{ student_id: { toString(): string }; status: string }> }
@@ -730,9 +1208,9 @@ router.get("/student-attendance-detail/:id", async (req: AuthRequest, res: Respo
     }
 
     const total = present + late + absent
-    const rate = total > 0 ? Math.round(((present + late * 0.5) / total) * 100) : null
+    const rate = calculateAttendanceRate(present, late, total)
 
-    res.json({ period, from, to, summary: { total, present, late, absent, rate }, records })
+    res.json({ period, from, to, summary: { total, present, late, absent, rate }, records, ...countedFields(counted) })
   } catch (err) {
     logger.error({ err: err }, "[student-attendance-detail]")
     res.status(500).json({ error: "Failed to load attendance details" })
@@ -918,17 +1396,18 @@ router.get("/my-class", async (req: AuthRequest, res: Response) => {
   }).select("grade section name").lean()
   if (!cls) { res.json({ class: null, students: [] }); return }
 
-  const students = await User.find({ class_id: cls._id, role: "student" }).select("name username is_active profile_photo_url").sort("name").lean()
+  const students = await User.find({ class_id: cls._id, school_id: currentUser.school_id, role: "student" })
+    .select({ name: 1, username: 1, is_active: 1, ...PHOTO_VERSION_PROJECTION }).sort("name").lean<ListedStudent[]>()
 
   const clsNameTA = (cls as unknown as { name?: string | null }).name
   res.json({
     class: { id: (cls._id as { toString(): string }).toString(), grade: cls.grade, section: cls.section, label: clsNameTA ?? (cls.grade > 0 ? `Class ${cls.grade}${cls.section}` : cls.section) },
     students: students.map(s => ({
-      id: (s._id as { toString(): string }).toString(),
+      id: s._id.toString(),
       name: s.name,
       username: s.username,
       is_active: s.is_active,
-      profile_photo_url: s.profile_photo_url ?? null,
+      photo_url: s.is_active ? photoPath(s._id.toString(), s.photo_v) : null,
     })),
   })
   } catch (err) {

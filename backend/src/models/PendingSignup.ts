@@ -17,6 +17,7 @@ export interface IPendingSignup extends Document {
   admin_phone: string
   first_class_grade: number | null
   first_class_section: string | null
+  first_class_name: string | null
   first_class_students: number | null
   first_teacher_name: string | null
   first_teacher_email: string | null
@@ -37,6 +38,7 @@ const pendingSignupSchema = new mongoose.Schema<IPendingSignup>({
   admin_phone:          { type: String, required: true },
   first_class_grade:    { type: Number, default: null },
   first_class_section:  { type: String, default: null },
+  first_class_name:     { type: String, default: null },
   first_class_students: { type: Number, default: null },
   first_teacher_name:   { type: String, default: null },
   first_teacher_email:  { type: String, default: null },

@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/contexts/AuthContext"
 import { signIn, signOut, sendPasswordResetOTP, verifyOTP, sendSmsOtp, verifySmsOtp } from "@/lib/auth"
+import { dashboardPathForRole, getSafeRedirectPath } from "@/lib/dashboardRoutes"
 
 type Step = "login" | "forgot-email" | "forgot-reset" | "otp" | "sms-send" | "sms-verify"
 type Role = "student" | "teacher" | "admin" | "parent"
@@ -30,6 +31,7 @@ export function LoginPage() {
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [apiError, setApiError] = useState("")
   const [successMsg, setSuccessMsg] = useState("")
+  const [signoutNotice, setSignoutNotice] = useState("")
   const [form, setForm] = useState({ identifier: "", password: "" })
   const [forgotIdentifier, setForgotIdentifier] = useState("")
   const [otpSession, setOtpSession] = useState("")
@@ -42,25 +44,32 @@ export function LoginPage() {
   const [smsOtpCode, setSmsOtpCode] = useState(["", "", "", "", "", ""])
   const [smsResendCountdown, setSmsResendCountdown] = useState(0)
 
+  // Where to go once signed in: the ?redirect= deep link if it is a dashboard path this role may
+  // open (whole-segment allowlist, see getSafeRedirectPath), otherwise the user's own dashboard.
+  const postLoginPath = (role: string) =>
+    getSafeRedirectPath(searchParams.get("redirect"), role) ?? dashboardPathForRole(role)
+
   // Redirect if already authenticated — honour ?redirect= param if present and safe
   useEffect(() => {
     if (!user) return
-    const redirectParam = searchParams.get("redirect")
-    const safePath = (() => {
-      if (!redirectParam) return null
-      try {
-        const resolved = new URL(redirectParam, window.location.href)
-        return resolved.origin === window.location.origin ? redirectParam : null
-      } catch {
-        return null
-      }
-    })()
-    if (safePath) { navigate(safePath, { replace: true }); return }
-    if (user.role === "student") navigate("/student/dashboard", { replace: true })
-    else if (user.role === "teacher") navigate("/teacher/dashboard", { replace: true })
-    else if (user.role === "parent") navigate("/parent/dashboard", { replace: true })
-    else navigate("/admin/dashboard", { replace: true })
+    navigate(getSafeRedirectPath(searchParams.get("redirect"), user.role) ?? dashboardPathForRole(user.role), { replace: true })
   }, [user, navigate, searchParams])
+
+  // One-time explanation when the user lands here because their session was ended
+  // by the app itself (15-min idle timeout, or a stale session detected on another
+  // tab/fetch) rather than something they did — read once, then cleared, so it
+  // never reappears on a later, unrelated visit to this page.
+  useEffect(() => {
+    try {
+      const reason = sessionStorage.getItem("ts_signout_reason")
+      if (reason === "idle") {
+        setSignoutNotice("You were signed out after 15 minutes of inactivity. Please sign in again.")
+      } else if (reason === "session-expired") {
+        setSignoutNotice("Your session has expired. Please sign in again.")
+      }
+      if (reason) sessionStorage.removeItem("ts_signout_reason")
+    } catch { /* sessionStorage unavailable — skip the notice, not worth failing login over */ }
+  }, [])
 
   // Auto-dismiss error after 10 seconds
   useEffect(() => {
@@ -129,10 +138,7 @@ export function LoginPage() {
       setUserFromLogin(profile)
       // Navigate: use confirmed role from backend; if fallback, trust the selected tab
       const dest = isFallback ? role : profile.role
-      if (dest === "student") navigate("/student/dashboard")
-      else if (dest === "teacher") navigate("/teacher/dashboard")
-      else if (dest === "parent") navigate("/parent/dashboard")
-      else navigate("/admin/dashboard")
+      navigate(postLoginPath(dest))
     } catch {
       setApiError("An unexpected error occurred. Please try again.")
     } finally {
@@ -150,10 +156,7 @@ export function LoginPage() {
       const { user: profile, error } = await verifyOTP(otpSession, code)
       if (error || !profile) { setApiError(error ?? "Invalid code. Please try again."); return }
       setUserFromLogin(profile)
-      if (profile.role === "student") navigate("/student/dashboard")
-      else if (profile.role === "teacher") navigate("/teacher/dashboard")
-      else if (profile.role === "parent") navigate("/parent/dashboard")
-      else navigate("/admin/dashboard")
+      navigate(postLoginPath(profile.role))
     } catch {
       setApiError("An unexpected error occurred. Please try again.")
     } finally {
@@ -212,10 +215,7 @@ export function LoginPage() {
       const { user: profile, error } = await verifySmsOtp(smsOtpSession, code)
       if (error || !profile) { setApiError(error ?? "Invalid code. Please try again."); return }
       setUserFromLogin(profile)
-      if (profile.role === "student") navigate("/student/dashboard")
-      else if (profile.role === "teacher") navigate("/teacher/dashboard")
-      else if (profile.role === "parent") navigate("/parent/dashboard")
-      else navigate("/admin/dashboard")
+      navigate(postLoginPath(profile.role))
     } catch {
       setApiError("An unexpected error occurred. Please try again.")
     } finally {
@@ -258,7 +258,7 @@ export function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 relative overflow-hidden" style={{ background: "linear-gradient(135deg, #EBF4FD 0%, #F8F9FA 50%, #F0EDFB 100%)" }}>
+    <div className="min-h-screen flex items-center justify-center p-4 relative overflow-hidden" style={{ background: "var(--gradient-hero)" }}>
       {/* Background decoration */}
       <div className="absolute inset-0 pointer-events-none" style={{ backgroundImage: "radial-gradient(circle, rgba(83,74,183,0.04) 1px, transparent 1px)", backgroundSize: "28px 28px" }} />
       <div className="absolute top-0 right-0 w-96 h-96 rounded-full opacity-20 blur-3xl" style={{ background: "radial-gradient(circle,#534AB7,transparent)", transform: "translate(30%, -30%)" }} />
@@ -283,6 +283,12 @@ export function LoginPage() {
             <>
               <h1 className="text-base font-bold text-foreground mb-0.5">Welcome back</h1>
               <p className="text-xs text-muted-foreground mb-4">Sign in to your TeachScript account</p>
+
+              {signoutNotice && (
+                <div role="status" aria-live="polite" className="mb-4 px-3 py-2.5 rounded-xl text-xs leading-relaxed" style={{ background: "rgba(55,138,221,0.08)", color: "#378ADD", border: "1px solid rgba(55,138,221,0.2)" }}>
+                  🔒 {signoutNotice}
+                </div>
+              )}
 
               {/* Role tabs */}
               <div className="flex gap-1 mb-5 p-1 rounded-xl bg-muted">

@@ -25,3 +25,7 @@ docker-compose.override.yml
 *.njsproj
 *.sln
 *.sw?
+# Playwright run artifacts (rule 14)
+ss_*.png
+test-results/
+playwright-report/

@@ -20,6 +20,9 @@ export interface IUser extends Document {
   is_active: boolean
   preferred_language: "english" | "hindi"
   profile_photo_url: string | null
+  // Set whenever the photo changes. Lists send a photo address that includes this time, so a
+  // browser only downloads a photo again after it has really changed.
+  profile_photo_updated_at: Date | null
   points: number
   must_change_password: boolean
   // Incremented on explicit sign-out so existing JWTs are immediately rejected.
@@ -42,6 +45,7 @@ const userSchema = new mongoose.Schema<IUser>({
   is_active:         { type: Boolean, default: true },
   preferred_language:{ type: String, enum: ["english", "hindi"], default: "english" },
   profile_photo_url:    { type: String, default: null },
+  profile_photo_updated_at: { type: Date, default: null },
   points:               { type: Number, default: 0 },
   must_change_password: { type: Boolean, default: false },
   token_version:        { type: Number, default: 0 },

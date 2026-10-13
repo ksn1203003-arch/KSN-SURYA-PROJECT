@@ -71,7 +71,7 @@ export function startPptxWorker(): void {
   _worker = new Worker<PptxJobData>(
     "pptx-conversion",
     async (job) => {
-      const { moduleId, itemId, gridfsId } = job.data
+      const { moduleId, itemId, gridfsId, schoolId, classId } = job.data
 
       // Stream PPTX out of GridFS to a temp file (avoids loading into RAM all at once)
       const bucket = getGridFSBucket("lesson_files")
@@ -95,7 +95,13 @@ export function startPptxWorker(): void {
 
         pdfGridfsId = await new Promise<mongoose.Types.ObjectId>((resolve, reject) => {
           const pdfStream = bucket.openUploadStream(`converted_${job.id}.pdf`, {
-            metadata: { converted_from: gridfsId, mime_type: "application/pdf" },
+            metadata: {
+              school_id:      schoolId,
+              class_id:       classId,
+              module_id:      moduleId,
+              converted_from: gridfsId,
+              mime_type:      "application/pdf",
+            },
           })
           pdfStream.on("error", async (err) => {
             try { await bucket.delete(pdfStream.id as mongoose.Types.ObjectId) } catch { /* gone */ }
@@ -110,11 +116,15 @@ export function startPptxWorker(): void {
 
       if (!pdfGridfsId) throw new Error("PDF conversion produced no output")
 
-      // Update the module item with the generated pdf_gridfs_id
-      await Module.updateOne(
+      // Link the PDF to the item. If the item or module was deleted meanwhile, nothing
+      // matches — remove the orphan PDF instead of leaving it in storage.
+      const linked = await Module.updateOne(
         { _id: moduleId, "items._id": itemId },
-        { $set: { "items.$.pdf_gridfs_id": pdfGridfsId } }
+        { $set: { "items.$.pdf_gridfs_id": pdfGridfsId, "items.$.conversion_status": "ready" } }
       )
+      if (linked.matchedCount === 0) {
+        await bucket.delete(pdfGridfsId).catch(() => {})
+      }
     },
     {
       connection: conn,
@@ -127,6 +137,11 @@ export function startPptxWorker(): void {
     // Move to DLQ once all retries are exhausted so the job data is preserved for debugging
     if (job && (job.attemptsMade ?? 0) >= (job.opts?.attempts ?? 2)) {
       moveToDLQ("pptx-conversion", job.id, job.data, (err as Error).message).catch(() => {})
+      // Tell the teacher it failed so they can re-upload — it is never retried automatically
+      Module.updateOne(
+        { _id: job.data.moduleId, "items._id": job.data.itemId },
+        { $set: { "items.$.conversion_status": "failed" } }
+      ).catch(updateErr => logger.error({ err: updateErr }, "[pptxWorker] could not mark conversion failed"))
     }
   })
 }

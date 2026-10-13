@@ -157,6 +157,11 @@
   --sidebar-border:  rgba(255,255,255,0.07);
   --sidebar-ring:    #4096E8;
   --ts-red-light:    #280A0A;
+  --gradient-hero:   linear-gradient(135deg, #0C1E33 0%, #111113 45%, #130D30 100%);
+  --gradient-student-hero:  linear-gradient(135deg, #130D30 0%, #111113 55%, #081F12 100%);
+  --gradient-lesson-card-1: linear-gradient(135deg, #0C1E33, #130D30);
+  --gradient-lesson-card-2: linear-gradient(135deg, #081F12, #0C1E33);
+  --gradient-lesson-card-3: linear-gradient(135deg, #1C1C1F, #130D30);
 }
 
 @layer base {
@@ -224,17 +229,29 @@
   --gradient-stat-amber:       linear-gradient(135deg, #E8960A 0%, #FBBF24 100%);
   --gradient-stat-purple:      linear-gradient(135deg, #6B4FD8 0%, #A78BFA 100%);
   --gradient-stat-red:         linear-gradient(135deg, #E24B4A 0%, #F87171 100%);
+  --gradient-student-hero:     linear-gradient(135deg,#E2DFF5 0%,#D7EAFB 55%,#DEF3D4 100%);
+  --gradient-lesson-card-1:    linear-gradient(135deg,#EEEDF8,#E6F1FB);
+  --gradient-lesson-card-2:    linear-gradient(135deg,#EAF3DE,#E6F1FB);
+  --gradient-lesson-card-3:    linear-gradient(135deg,#F5F4F0,#EEEDF8);
   --glass-bg:                  rgba(255, 255, 255, 0.78);
   --glass-border:              rgba(255, 255, 255, 0.5);
   --glass-shadow:              0 4px 24px rgba(0, 0, 0, 0.07);
+  --ts-today-bg:               rgba(83,74,183,0.06);
+  --ts-today-border:           rgba(83,74,183,0.18);
 }
 
 .dark {
-  --gradient-hero:       linear-gradient(135deg, #0C1E33 0%, #111113 45%, #081F12 100%);
-  --gradient-card-shine: linear-gradient(135deg, rgba(64,150,232,0.07) 0%, transparent 60%);
+  --gradient-hero:          linear-gradient(135deg, #0C1E33 0%, #111113 45%, #081F12 100%);
+  --gradient-card-shine:    linear-gradient(135deg, rgba(64,150,232,0.07) 0%, transparent 60%);
+  --gradient-student-hero:  linear-gradient(135deg, #130D30 0%, #111113 55%, #081F12 100%);
+  --gradient-lesson-card-1: linear-gradient(135deg, #0C1E33, #130D30);
+  --gradient-lesson-card-2: linear-gradient(135deg, #081F12, #0C1E33);
+  --gradient-lesson-card-3: linear-gradient(135deg, #1C1C1F, #130D30);
   --glass-bg:            rgba(28, 28, 31, 0.82);
   --glass-border:        rgba(255, 255, 255, 0.07);
   --glass-shadow:        0 8px 32px rgba(0, 0, 0, 0.45);
+  --ts-today-bg:         rgba(139,124,246,0.13);
+  --ts-today-border:     rgba(139,124,246,0.32);
 }
 
 @keyframes progressFill {
@@ -255,6 +272,16 @@
 @keyframes fadeInUp {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes modalBackdropIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes modalPopIn {
+  from { opacity: 0; transform: scale(0.94) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
 }
 
 @keyframes pulse-glow {

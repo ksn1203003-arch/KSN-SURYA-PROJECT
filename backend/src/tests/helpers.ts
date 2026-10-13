@@ -48,16 +48,20 @@ export async function createSchool() {
 export async function createClass(
   schoolId: mongoose.Types.ObjectId,
   teacherId?: mongoose.Types.ObjectId,
-  overrides: { grade?: number; section?: string; name?: string } = {},
+  overrides: { grade?: number; section?: string; name?: string; year_start?: string | null } = {},
 ) {
   const grade   = overrides.grade   ?? 5
   const section = overrides.section ?? String.fromCharCode(65 + Math.floor(Math.random() * 26)) + Date.now().toString(36).slice(-4)
   const name    = overrides.name    ?? `Class ${grade}${section}`
+  // A class now needs a stored school-year start before attendance can be saved, so tests get an early one by default.
+  // A test that wants a class with no stored start (an older class) passes year_start: null.
+  const year_start = overrides.year_start === undefined ? "2000-01-01" : overrides.year_start
   return Class.create({
     school_id: schoolId,
     grade,
     section,
     name,
+    year_start,
     subjects: ["Math", "Science", "English"],
     teachers: teacherId
       ? [{ teacher_id: teacherId, subject: "Math" }]

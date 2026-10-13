@@ -11,6 +11,7 @@ import { createHmac, timingSafeEqual, randomBytes } from "crypto"
 import { User } from "../models/User.js"
 import { School } from "../models/School.js"
 import { PendingSignup } from "../models/PendingSignup.js"
+import { cleanClassName } from "../lib/className.js"
 import { sendEmail as sendEmailViaLib } from "../lib/email.js"
 
 const router = Router()
@@ -102,6 +103,35 @@ router.post("/request", async (req, res) => {
       return res.status(400).json({ error: "Phone number must be digits only, under 15 characters" })
     }
 
+    // ── First class (optional): validate and clean before anything is stored ───
+    let firstClassGrade: number | null = null
+    let firstClassSection: string | null = null
+    let firstClassName: string | null = null
+    let firstClassStudents = 0
+    if (firstClass !== undefined && firstClass !== null) {
+      if (typeof firstClass !== "object") return res.status(400).json({ error: "First class details are not valid" })
+      if (firstClass.grade !== undefined && firstClass.grade !== null && firstClass.grade !== "") {
+        const g = Number(firstClass.grade)
+        if (!Number.isInteger(g) || g < 0 || g > 20) return res.status(400).json({ error: "Class grade must be a whole number from 0 to 20" })
+        firstClassGrade = g
+      }
+      if (firstClass.section !== undefined && firstClass.section !== null && firstClass.section !== "") {
+        const cleaned = cleanClassName(firstClass.section)
+        if (!cleaned.ok) return res.status(400).json({ error: cleaned.error })
+        firstClassSection = cleaned.value
+      }
+      if (firstClass.name !== undefined && firstClass.name !== null && firstClass.name !== "") {
+        const cleaned = cleanClassName(firstClass.name)
+        if (!cleaned.ok) return res.status(400).json({ error: cleaned.error })
+        firstClassName = cleaned.value
+      }
+      if (firstClass.numStudents !== undefined && firstClass.numStudents !== null && firstClass.numStudents !== "") {
+        const n = Number(firstClass.numStudents)
+        if (!Number.isInteger(n) || n < 0 || n > 100000) return res.status(400).json({ error: "Number of students must be a whole number from 0 to 100000" })
+        firstClassStudents = n
+      }
+    }
+
     const activeUser = await User.findOne({ email: admin.email.toLowerCase() }).select("_id").lean()
     if (activeUser) return res.status(409).json({ error: "This email already has an account." })
 
@@ -117,9 +147,10 @@ router.post("/request", async (req, res) => {
       admin_name:            admin.name,
       admin_email:           admin.email.toLowerCase(),
       admin_phone:           admin.phone,
-      first_class_grade:     firstClass?.grade     ?? null,
-      first_class_section:   firstClass?.section   ?? null,
-      first_class_students:  Number(firstClass?.numStudents) || 0,
+      first_class_grade:     firstClassGrade,
+      first_class_section:   firstClassSection,
+      first_class_name:      firstClassName,
+      first_class_students:  firstClassStudents,
       first_teacher_name:    firstTeacher?.name    ?? null,
       first_teacher_email:   firstTeacher?.email   ?? null,
       first_teacher_phone:   firstTeacher?.phone   ?? null,

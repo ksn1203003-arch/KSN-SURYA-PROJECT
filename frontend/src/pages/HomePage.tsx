@@ -24,40 +24,40 @@ const CURRICULUM = [
   { grade: 8, title: "Class 8", desc: "Functions, Python intro, neural networks, capstone project", periods: 40, emoji: "🤖" },
 ]
 
-const TESTIMONIALS = [
-  { quote: "This saved me 3 hours every week. I don't know Python but my students are learning Scratch confidently.", name: "Priya Sharma", role: "CS Teacher, DPS Hyderabad", initials: "PS", gradient: "var(--gradient-stat-blue)" },
-  { quote: "We became curriculum compliant without hiring a new teacher. The compliance report PDF was exactly what we needed for the board inspection.", name: "Rekha Kapoor", role: "Principal, St. Mary's School, Pune", initials: "RK", gradient: "var(--gradient-stat-green)" },
-  { quote: "The ROI is clear. ₹40,000 per year versus ₹3.5 lakhs to hire a specialist. No contest.", name: "Ramesh Iyer", role: "School Trustee, Vidya Niketan, Bengaluru", initials: "RI", gradient: "var(--gradient-stat-amber)" },
+const WHY_EARLY_SCHOOLS = [
+  { quote: "One login replaces five different tools — attendance registers, mark sheets, homework diaries, certificate templates, and parent WhatsApp groups all in one place.", name: "Unified by design", role: "Student, Teacher, Admin & Parent dashboards", initials: "✓", gradient: "var(--gradient-stat-blue)" },
+  { quote: "Certificates are generated with your own school's logo and colours — not a generic template. Attendance, marks, and progress update the moment a teacher enters them.", name: "Built for your school", role: "Custom branding, real-time updates", initials: "✓", gradient: "var(--gradient-stat-green)" },
+  { quote: "Founding schools get a direct line to shape what we build next, plus founding-tier pricing locked in before it increases as new features launch.", name: "Founding school pricing", role: "Early access, roadmap input", initials: "✓", gradient: "var(--gradient-stat-amber)" },
 ]
 
 const STEPS = [
   { num: 1, title: "School subscribes", desc: "Annual plan. 14-day free trial. No credit card needed.", emoji: "🏫" },
-  { num: 2, title: "Teachers get login", desc: "Instant access for all CS teachers via phone or email.", emoji: "👩‍🏫" },
-  { num: 3, title: "Open Monday's lesson", desc: "Ready-made PPT, script, and activity waiting for you.", emoji: "📅" },
-  { num: 4, title: "Read the whisper script", desc: "Word-by-word guide. Just read and teach.", emoji: "📖" },
-  { num: 5, title: "Students do the activity", desc: "Unplugged or Scratch-based. Works with or without computers.", emoji: "✏️" },
-  { num: 6, title: "Quiz auto-graded", desc: "5 questions. Students join with class code. Results instant.", emoji: "✅" },
+  { num: 2, title: "Everyone gets a login", desc: "Instant access for Students, Teachers, Admins, and Parents.", emoji: "👩‍🏫" },
+  { num: 3, title: "Mark attendance, enter marks", desc: "One tap for attendance. Marks and grades calculate automatically.", emoji: "📅" },
+  { num: 4, title: "Push homework & quizzes", desc: "Teachers assign work; students submit and get graded instantly.", emoji: "📖" },
+  { num: 5, title: "Certificates auto-generate", desc: "With your school's own logo, the moment a student qualifies.", emoji: "✏️" },
+  { num: 6, title: "Parents stay updated", desc: "Live attendance, marks, and progress — no separate app needed.", emoji: "✅" },
 ]
 
 const STATS = [
-  { end: 210, suffix: "+", label: "Ready Lessons", icon: BookOpen, gradient: "var(--gradient-stat-blue)" },
-  { end: 500, suffix: "+", label: "Schools", icon: GraduationCap, gradient: "var(--gradient-stat-green)" },
-  { end: 98, suffix: "%", label: "Satisfaction", icon: Star, gradient: "var(--gradient-stat-amber)" },
-  { end: 50000, suffix: "+", label: "Students", icon: Users, gradient: "var(--gradient-stat-purple)" },
+  { end: 4, suffix: "", label: "User Roles", icon: Users, gradient: "var(--gradient-stat-blue)" },
+  { end: 6, suffix: "", label: "Core Modules", icon: Star, gradient: "var(--gradient-stat-amber)" },
+  { end: 210, suffix: "+", label: "Ready CS Lessons", icon: BookOpen, gradient: "var(--gradient-stat-green)" },
+  { end: 14, suffix: "-day", label: "Free Trial", icon: GraduationCap, gradient: "var(--gradient-stat-purple)" },
 ]
 
 const MARQUEE_ITEMS = [
-  "✓ CBSE & State Board Aligned", "✓ 210 Ready Lessons", "✓ Classes 3 to 8",
-  "✓ Zero Prep Time", "✓ Any Teacher Can Teach", "✓ Auto-Graded Quizzes",
-  "✓ Bilingual Support", "✓ Whisper Scripts Included", "✓ 14-Day Free Trial",
+  "✓ Attendance & Marks Tracking", "✓ Homework & Quizzes", "✓ Certificates with Your Branding",
+  "✓ CBSE & State Board Aligned", "✓ Any Class, Any Grade", "✓ Auto-Graded Quizzes",
+  "✓ Bilingual Support", "✓ Parent Dashboard Included", "✓ 14-Day Free Trial",
   "✓ No Credit Card Required",
 ]
 
 const TYPEWRITER_WORDS = [
-  "Monday's CS class",
-  "every lesson plan",
-  "Classes 3 to 8",
-  "any teacher's prep",
+  "attendance & marks",
+  "homework & quizzes",
+  "every class, every grade",
+  "report cards & certificates",
 ]
 
 const CARD_GRADIENTS = [
@@ -497,7 +497,7 @@ export function HomePage() {
             <span className="inline-flex items-center gap-2 text-xs font-bold px-4 py-2 rounded-full mb-7 glass-card animate-glow-pulse border border-ts-blue/25">
               <Sparkles className="w-3.5 h-3.5 text-ts-blue" />
               <span className="text-ts-blue-dark dark:text-blue-300">
-                CBSE & State Board Aligned · India's #1 CS Lesson Platform
+                CBSE & State Board Aligned · Built for Every Class
               </span>
             </span>
           </div>
@@ -520,9 +520,9 @@ export function HomePage() {
 
           <div className="animate-hero-entrance" style={{ animationDelay: "0.35s" }}>
             <p className="text-base md:text-lg text-muted-foreground mb-10 max-w-2xl mx-auto leading-relaxed">
-              Ready-made lessons, whisper scripts, quizzes and activities for Classes 3–8.
-              Any teacher can teach Computer Science —{" "}
-              <strong className="text-foreground">no background needed.</strong>
+              Attendance, marks, homework, quizzes, and certificates — for every class in your school.
+              Plus a ready-made Computer Science curriculum for Classes 3–8 —{" "}
+              <strong className="text-foreground">no CS background needed to teach it.</strong>
             </p>
           </div>
 
@@ -546,7 +546,7 @@ export function HomePage() {
 
           {/* Trust badge pills */}
           <div className="animate-hero-entrance flex flex-wrap items-center justify-center gap-3" style={{ animationDelay: "0.55s" }}>
-            {["🎓 210 ready lessons", "📚 Classes 3–8", "✅ CBSE & State Board", "⚡ Zero prep time", "🆓 14-day free trial"].map((badge, i) => (
+            {["📊 Attendance & marks", "🏅 Certificates included", "👨‍👩‍👧 Parent dashboard", "🎓 210 ready CS lessons", "🆓 14-day free trial"].map((badge, i) => (
               <span
                 key={badge}
                 className="text-xs px-3.5 py-1.5 rounded-full glass-card border border-border/40 font-medium text-foreground/70"
@@ -590,16 +590,16 @@ export function HomePage() {
 
           <RevealSection className="text-center mb-14">
             <span className="text-[11px] font-black tracking-[0.2em] uppercase text-ts-blue mb-3 block">What You Get</span>
-            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">Every lesson, fully loaded</h2>
-            <p className="text-sm text-muted-foreground max-w-lg mx-auto">Four pillars that make any teacher a CS teacher in minutes</p>
+            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">Everything, fully loaded</h2>
+            <p className="text-sm text-muted-foreground max-w-lg mx-auto">Four pillars that run your whole school in one place</p>
           </RevealSection>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
             {[
-              { gradient: "var(--gradient-stat-blue)",   title: "Ready PPT",        desc: "12–15 slides with Indian examples. Bilingual English and Hindi.", emoji: "📊" },
-              { gradient: "var(--gradient-stat-amber)",  title: "Whisper Script",   desc: "Word-by-word — exactly what to say on every single slide.", emoji: "🎙️" },
-              { gradient: "var(--gradient-stat-green)",  title: "Student Activity", desc: "Unplugged version (no computer) and plugged version (Scratch/web).", emoji: "✏️" },
-              { gradient: "var(--gradient-stat-purple)", title: "AI Assistant",     desc: "Ask anything about the lesson. Get an answer in plain language instantly.", emoji: "🤖" },
+              { gradient: "var(--gradient-stat-blue)",   title: "Attendance & Marks",  desc: "One tap for attendance. Marks, percentages, and letter grades calculate automatically.", emoji: "📊" },
+              { gradient: "var(--gradient-stat-amber)",  title: "Homework & Quizzes",  desc: "Assign work, auto-grade quizzes, and give feedback — all in one dashboard.", emoji: "📝" },
+              { gradient: "var(--gradient-stat-green)",  title: "Certificates",        desc: "Auto-generated with your own school's logo and colours, the moment a student qualifies.", emoji: "🏅" },
+              { gradient: "var(--gradient-stat-purple)", title: "AI Assistant",        desc: "Ask anything about any lesson. Get an answer in plain language instantly.", emoji: "🤖" },
             ].map((card, i) => (
               <RevealSection key={card.title} delay={i * 90} direction="up">
                 <Tilt3D className="h-full">
@@ -625,8 +625,8 @@ export function HomePage() {
 
           <RevealSection className="text-center mb-14">
             <span className="text-[11px] font-black tracking-[0.2em] uppercase text-ts-blue mb-3 block">How It Works</span>
-            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">Teach CS in 4 minutes. No preparation.</h2>
-            <p className="text-sm text-muted-foreground">Six simple steps from subscription to a complete lesson delivered.</p>
+            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">Up and running in a day. No setup headaches.</h2>
+            <p className="text-sm text-muted-foreground">Six simple steps from subscription to your whole school online.</p>
           </RevealSection>
 
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-5">
@@ -711,7 +711,7 @@ export function HomePage() {
           <RevealSection className="text-center mb-10">
             <span className="text-[11px] font-black tracking-[0.2em] uppercase text-ts-blue mb-3 block">ROI Calculator</span>
             <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">See how much your school saves</h2>
-            <p className="text-sm text-muted-foreground">Compare TeachScript vs hiring a full-time CS teacher</p>
+            <p className="text-sm text-muted-foreground">Compare the TeachScript subscription vs hiring a dedicated CS teacher</p>
           </RevealSection>
 
           <RevealSection direction="scale">
@@ -730,19 +730,19 @@ export function HomePage() {
         </div>
       </section>
 
-      {/* ── TESTIMONIALS ──────────────────────────────────────────────────── */}
+      {/* ── WHY EARLY SCHOOLS CHOOSE US ───────────────────────────────────── */}
       <div className="section-glow-divider" />
       <section className="py-20 px-4 relative overflow-hidden">
         <AuroraLayer colors={["rgba(107,79,216,0.18)","rgba(43,130,217,0.15)"]} scrollY={scrollY} depth={0.035} />
         <div className="max-w-5xl mx-auto relative z-10">
 
           <RevealSection className="text-center mb-14">
-            <span className="text-[11px] font-black tracking-[0.2em] uppercase text-ts-blue mb-3 block">Testimonials</span>
-            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">What schools are saying</h2>
+            <span className="text-[11px] font-black tracking-[0.2em] uppercase text-ts-blue mb-3 block">Why Early Schools Choose Us</span>
+            <h2 className="text-3xl md:text-4xl font-black text-foreground mb-3">Built different, from day one</h2>
           </RevealSection>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-            {TESTIMONIALS.map((t, i) => (
+            {WHY_EARLY_SCHOOLS.map((t, i) => (
               <RevealSection
                 key={t.name}
                 delay={i * 90}
@@ -751,7 +751,6 @@ export function HomePage() {
                 <Tilt3D className="h-full">
                 <div className="glass-card card-glow rounded-[18px] p-6 flex flex-col gap-4 relative overflow-hidden h-full">
                   <div className="absolute top-0 left-0 right-0 h-1.5" style={{ background: t.gradient }} />
-                  <div className="text-lg tracking-wide">⭐⭐⭐⭐⭐</div>
                   <p className="text-sm text-foreground leading-relaxed flex-1">"{t.quote}"</p>
                   <div className="flex items-center gap-3">
                     <div
@@ -838,9 +837,9 @@ export function HomePage() {
         <RevealSection className="relative z-10 max-w-2xl mx-auto text-center">
           <div className="text-4xl mb-4">🚀</div>
           <h2 className="text-2xl md:text-3xl font-black text-white mb-3">
-            Ready to transform CS education at your school?
+            Ready to run your whole school on one platform?
           </h2>
-          <p className="text-sm text-white/75 mb-8">Join 500+ schools already using TeachScript. Start your free 14-day trial today.</p>
+          <p className="text-sm text-white/75 mb-8">Be among the first schools to try it. Start your free 14-day trial today.</p>
           <div className="flex flex-wrap items-center justify-center gap-4">
             <Button
               onClick={() => navigate("/signup")}

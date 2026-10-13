@@ -8,6 +8,8 @@ import cors from "cors"
 import helmet from "helmet"
 import compression from "compression"
 import { rateLimit } from "express-rate-limit"
+import { SharedRateLimitStore } from "./lib/rateLimitStore.js"
+import { serializeRequestForLog } from "./lib/redactUrl.js"
 import pinoHttp from "pino-http"
 import * as Sentry from "@sentry/node"
 import { logger } from "./lib/logger.js"
@@ -33,10 +35,10 @@ import marksRouter from "./routes/marks.js"
 import dpdpRouter from "./routes/dpdp.js"
 import homeworkRouter from "./routes/homework.js"
 import parentRouter from "./routes/parent.js"
+import photosRouter from "./routes/photos.js"
 import { requireAuth } from "./middleware/auth.js"
 import { backpressure } from "./middleware/backpressure.js"
 import { errorHandler } from "./middleware/errorHandler.js"
-import { convertExistingPptx } from "./jobs/convertExistingPptx.js"
 import { startMidnightClockOut } from "./jobs/midnightClockOut.js"
 import { startPptxWorker, stopPptxWorker } from "./jobs/pptxWorker.js"
 import { startPdfWorker, stopPdfWorker } from "./jobs/pdfWorker.js"
@@ -105,7 +107,8 @@ app.use(pinoHttp({
   genReqId: (req) => (req.headers["x-request-id"] as string | undefined) ?? crypto.randomUUID(),
   customLogLevel: (_req, res) => res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info",
   serializers: {
-    req: (req) => ({ method: req.method, url: req.url, id: req.id }),
+    // Stream, file and reset tokens in the query string are hidden before logging
+    req: serializeRequestForLog,
     res: (res) => ({ statusCode: res.statusCode }),
   },
 }))
@@ -142,8 +145,21 @@ app.use(cors({
 // Shed excess requests when connection pool is near saturation
 app.use(backpressure)
 
-// Rate limiting — per IP, per minute
-const generalLimit   = rateLimit({ windowMs: 60_000, max: 300, standardHeaders: true, legacyHeaders: false }) // general API
+// Rate limiting — per IP, per minute. Counters are shared through Redis when it is
+// configured (all server copies count together) and kept in memory otherwise.
+// Profile photos and the parts of a playing video have their own limits (below), so a
+// class list full of avatars or a lab of students watching a lesson never uses up the
+// school's general budget and blocks an attendance save.
+const isPhotoOrVideoPart = (req: express.Request) =>
+  req.method === "GET" && (req.path.startsWith("/photos/") || (req.path.startsWith("/files/") && typeof req.query.st === "string"))
+const generalLimit   = rateLimit({ windowMs: 60_000, max: 300, standardHeaders: true, legacyHeaders: false, store: new SharedRateLimitStore("api"), skip: isPhotoOrVideoPart }) // general API
+// Per signed-in user (mounted after requireAuth): plenty for several class lists a minute
+const photoLimit     = rateLimit({
+  windowMs: 60_000, max: 240,
+  keyGenerator: (req) => (req as unknown as { userId?: string }).userId ?? req.ip ?? "unknown",
+  standardHeaders: true, legacyHeaders: false, store: new SharedRateLimitStore("photos"),
+})
+
 // AI rate limit keys on userId after requireAuth so each teacher gets their own 30/min budget
 // rather than sharing one budget per school IP (all teachers behind the same NAT)
 const aiLimit        = rateLimit({
@@ -151,15 +167,16 @@ const aiLimit        = rateLimit({
   keyGenerator: (req) => (req as unknown as { userId?: string }).userId ?? req.ip ?? "unknown",
   standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many AI requests. Please wait a moment before trying again." },
+  store: new SharedRateLimitStore("ai"),
 })
-const userLimit      = rateLimit({ windowMs: 60_000, max: 60,  standardHeaders: true, legacyHeaders: false }) // user create/invite
-const heavyLimit     = rateLimit({ windowMs: 60_000, max: 20,  standardHeaders: true, legacyHeaders: false }) // PDF generation
-const rl = (max: number) => rateLimit({ windowMs: 15 * 60_000, max, standardHeaders: true, legacyHeaders: false, message: { error: "Too many attempts. Please try again in 15 minutes." } })
-const signinLimit      = rl(5)   // brute-force protection on password login
-const forgotPwdLimit   = rl(5)   // prevent password reset email spam
-const otpVerifyLimit   = rl(10)  // email 2FA code verification (slightly more for legit use)
-const smsOtpSendLimit  = rl(5)   // prevent SMS flooding
-const smsOtpVerifyLimit = rl(10) // SMS OTP code verification
+const userLimit      = rateLimit({ windowMs: 60_000, max: 60,  standardHeaders: true, legacyHeaders: false, store: new SharedRateLimitStore("users") }) // user create/invite
+const heavyLimit     = rateLimit({ windowMs: 60_000, max: 20,  standardHeaders: true, legacyHeaders: false, store: new SharedRateLimitStore("heavy") }) // PDF generation
+const rl = (name: string, max: number) => rateLimit({ windowMs: 15 * 60_000, max, standardHeaders: true, legacyHeaders: false, message: { error: "Too many attempts. Please try again in 15 minutes." }, store: new SharedRateLimitStore(name) })
+const signinLimit      = rl("signin", 5)          // brute-force protection on password login
+const forgotPwdLimit   = rl("forgot-password", 5) // prevent password reset email spam
+const otpVerifyLimit   = rl("verify-otp", 10)     // email 2FA code verification (slightly more for legit use)
+const smsOtpSendLimit  = rl("send-sms-otp", 5)    // prevent SMS flooding
+const smsOtpVerifyLimit = rl("verify-sms-otp", 10) // SMS OTP code verification
 
 app.use("/api", generalLimit)
 app.use("/api/users", userLimit)
@@ -195,17 +212,24 @@ app.use("/api/payments", paymentsRouter)       // webhook has its own signature 
 app.use("/api/whatsapp", requireAuth, whatsappRouter)
 app.use("/api/teacher", requireAuth, teacherRouter)
 app.use("/api/modules",               requireAuth, modulesRouter)
-app.use("/api/files",                 filesRouter)  // token-based auth — no JWT required
+app.use("/api/files",                 filesRouter)  // token-based auth — no JWT required; video parts limited inside
 app.use("/api/student",               requireAuth, studentRouter)
 app.use("/api/quizzes",               requireAuth, quizzesRouter)
 app.use("/api/challenges",            requireAuth, challengesRouter)
 app.use("/api/student-certificates",  requireAuth, studentCertificatesRouter)
-app.use("/api/run", rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false }))
+app.use("/api/run", rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false, store: new SharedRateLimitStore("run") }))
 app.use("/api/run", requireAuth, runRouter)
 app.use("/api/marks",   requireAuth, marksRouter)
 app.use("/api/dpdp",    requireAuth, dpdpRouter)
 app.use("/api/homework", requireAuth, homeworkRouter)
 app.use("/api/parent",   requireAuth, parentRouter)
+app.use("/api/photos",   requireAuth, photoLimit, photosRouter)
+
+// Express 4 does not catch errors thrown by async route handlers. Log them instead of
+// letting one bad request stop the whole server.
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "[process] unhandled promise rejection")
+})
 
 // Basic health check — used by Docker healthcheck and load balancers
 app.get("/health", (_req, res) => res.json({ status: "ok", ts: Date.now() }))
@@ -308,9 +332,6 @@ app.use(errorHandler)
 connectDB().then(() => {
   const server = app.listen(PORT, () => {
     logger.info({ port: PORT }, "TeachScript Backend listening")
-    convertExistingPptx().catch(err =>
-      logger.error({ err }, "pptx-convert: background conversion error")
-    )
     startMidnightClockOut()
     startPptxWorker()
     startPdfWorker()

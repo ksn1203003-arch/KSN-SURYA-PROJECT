@@ -73,8 +73,8 @@ const FAQS = [
   { q: "Can I try before paying?", a: "Yes, 14-day free trial. No credit card. Cancel anytime." },
   { q: "What happens after the trial?", a: "We will call you. If you want to continue, we raise a purchase order." },
   { q: "Do I need to buy new computers or tablets?", a: "No. Works on any existing device. Lessons also download for offline use." },
-  { q: "Is this aligned to CBSE and State Board curriculum?", a: "Yes. Every lesson is structured for Computer Science teaching across CBSE, State Board, and ICSE schools. CBSE schools get full CT&AI skill code mapping." },
-  { q: "What if my teacher doesn't know CS?", a: "That is exactly who this is for. The whisper script tells her word-by-word what to say." },
+  { q: "Does this work for subjects other than Computer Science?", a: "Yes. Attendance, marks, homework, quizzes, and certificates work for every subject and every class. The ready-made CS curriculum is an optional add-on, mapped to CBSE, State Board, and ICSE — CBSE schools get full CT&AI skill code mapping." },
+  { q: "What if my teacher doesn't know CS?", a: "That's exactly who the CS curriculum module is built for — the whisper script tells them word-by-word what to say, lesson by lesson." },
   { q: "Is student data safe?", a: "Yes. We comply with DPDP Act 2023. No behavioral tracking. No ads. No student PII for Class 3\u20135." },
 ]
 

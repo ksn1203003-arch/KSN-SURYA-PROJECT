@@ -7,7 +7,8 @@ export default defineConfig({
   workers:    1,          // serial — tests share one DB, avoid race conditions
   reporter:   "list",
   use: {
-    baseURL:       "http://localhost:5173",
+    // Override with E2E_BASE_URL to run the same specs against a production build (`vite preview`).
+    baseURL:       process.env.E2E_BASE_URL ?? "http://localhost:5173",
     headless:      true,
     slowMo:        0,
     screenshot:    "only-on-failure",

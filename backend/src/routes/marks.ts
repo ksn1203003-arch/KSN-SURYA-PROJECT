@@ -5,15 +5,33 @@ import { ExamDefinition, type IGradeScale, type IExamDefinition } from "../model
 import { ExamResult } from "../models/ExamResult.js"
 import { User } from "../models/User.js"
 import { Class } from "../models/Class.js"
-import { renderHtmlToPdf } from "../lib/pdf.js"
-import { getPdfQueue, getPdfQueueEvents, type PdfJobResult } from "../jobs/queue.js"
+import { getReportCardPdf } from "../services/reportCardPdf.js"
 import { fetchReportCardData } from "../services/reportCard.js"
 import { buildReportCardHTML } from "../lib/reportCardTemplate.js"
 import { AuditLog } from "../models/AuditLog.js"
 import { logger } from "../lib/logger.js"
+import { rateLimit } from "express-rate-limit"
+import { SharedRateLimitStore } from "../lib/rateLimitStore.js"
+import { validateObjectId } from "../lib/validateId.js"
 
 const router = Router()
 router.use(requireAuth)
+
+// Every :id in this router is an exam id — a malformed one is a clean 400, never a crash
+router.param("id", (_req, res, next, id: string) => {
+  if (!mongoose.isValidObjectId(id)) { res.status(400).json({ error: "Invalid exam ID" }); return }
+  next()
+})
+
+// Report cards: 10 a minute per signed-in person. A school shares one network address,
+// so a per-address budget would let one student block the whole school.
+const reportCardLimit = rateLimit({
+  windowMs: 60_000, max: 10,
+  keyGenerator: (req) => (req as AuthRequest).userId ?? req.ip ?? "unknown",
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many report card downloads. Please wait a minute and try again." },
+  store: new SharedRateLimitStore("report-card"),
+})
 
 function calcGrade(pct: number, scale: IGradeScale[]): string {
   const sorted = [...scale].sort((a, b) => b.min - a.min)
@@ -38,8 +56,11 @@ function validateGradeScale(gs: unknown): string | null {
 
 // ── GET /api/marks/exams — list exams for a class ─────────────────────────────
 router.get("/exams", async (req: AuthRequest, res: Response) => {
-  const { class_id } = req.query as { class_id?: string }
+  const { class_id } = req.query as { class_id?: unknown }
   if (!class_id) return void res.status(400).json({ error: "class_id is required" })
+  if (typeof class_id !== "string" || !mongoose.isValidObjectId(class_id)) {
+    return void res.status(400).json({ error: "Invalid class_id" })
+  }
 
   const user = await User.findById(req.userId).select("school_id").lean()
   if (!user) return void res.status(401).json({ error: "User not found" })
@@ -84,6 +105,9 @@ router.post("/exams", async (req: AuthRequest, res: Response) => {
   }
   if (!class_id || !title?.trim() || !date || !subjects?.length) {
     return void res.status(400).json({ error: "class_id, title, date, and subjects are required" })
+  }
+  if (typeof class_id !== "string" || !mongoose.isValidObjectId(class_id)) {
+    return void res.status(400).json({ error: "Invalid class_id" })
   }
   if (subjects.some(s => !s.name?.trim() || s.max_marks < 1)) {
     return void res.status(400).json({ error: "Each subject needs a name and max_marks ≥ 1" })
@@ -400,11 +424,14 @@ router.get("/my-results", async (req: AuthRequest, res: Response) => {
 
 // ── GET /api/marks/class-summary — teacher/admin: exam list + student list ────
 router.get("/class-summary", async (req: AuthRequest, res: Response) => {
-  if (req.userRole === "student") {
-    return void res.status(403).json({ error: "Not available for students" })
+  if (!["teacher", "admin", "super_admin"].includes(req.userRole ?? "")) {
+    return void res.status(403).json({ error: "Only school staff can see this" })
   }
-  const { class_id } = req.query as { class_id?: string }
+  const { class_id } = req.query as { class_id?: unknown }
   if (!class_id) return void res.status(400).json({ error: "class_id is required" })
+  if (typeof class_id !== "string" || !mongoose.isValidObjectId(class_id)) {
+    return void res.status(400).json({ error: "Invalid class_id" })
+  }
 
   const user = await User.findById(req.userId).select("school_id").lean()
   if (!user) return void res.status(401).json({ error: "User not found" })
@@ -429,108 +456,104 @@ router.get("/class-summary", async (req: AuthRequest, res: Response) => {
 
 
 /**
- * Generate a report card PDF and send it as an HTTP response.
- * When Redis/BullMQ is available the work runs in the pdfWorker process,
- * protecting the HTTP event loop. Falls back to inline Puppeteer if not configured.
+ * Send a student's report card PDF. The PDF is built once per version of its
+ * content (services/reportCardPdf.ts) and reused for every later download, so a
+ * repeated click costs a database read, not a new Puppeteer render.
+ * Callers must already have checked that the requester may see this student.
  */
 async function sendReportCardPdf(
   res: Response,
   html: string,
   safeName: string,
-  userId: string,
+  ids: { schoolId: string; studentId: string; requestedBy: string },
 ): Promise<void> {
-  const queue = getPdfQueue()
-
-  if (queue) {
-    // Queue path — await job result then stream the stored PDF buffer
-    const job = await queue.add("generate", {
-      type: "report-card" as const,
-      html,
-      fileName: `report-card-${safeName}.pdf`,
-      userId,
-    })
-    const queueEvents = getPdfQueueEvents()
-    const result = queueEvents
-      ? await job.waitUntilFinished(queueEvents, 30_000).catch(() => null) as PdfJobResult | null
-      : null
-
-    if (!result) {
-      // Job timed out or failed — fall through to sync generation
-    } else {
-      res.set({
-        "Content-Type": "application/pdf",
-        "Content-Disposition": `attachment; filename*=UTF-8''report-card-${encodeURIComponent(safeName)}.pdf`,
-        "X-PDF-Token": result.token,
-      })
-      // The pdfWorker stored the PDF in GridFS; stream it back directly
-      const { getGridFSBucket } = await import("../lib/gridfs.js")
-      const bucket = getGridFSBucket("pdf_reports")
-      const stream = bucket.openDownloadStream(new mongoose.Types.ObjectId(result.gridfsId))
-      stream.pipe(res)
-      return
-    }
-  }
-
-  // Sync fallback (no Redis, or job timed out)
-  const pdfBuf = await renderHtmlToPdf(html, { format: "A4" })
+  const pdf = await getReportCardPdf({
+    schoolId:    ids.schoolId,
+    studentId:   ids.studentId,
+    html,
+    fileName:    `report-card-${safeName}.pdf`,
+    requestedBy: ids.requestedBy,
+  })
   res.set({
     "Content-Type": "application/pdf",
     "Content-Disposition": `attachment; filename*=UTF-8''report-card-${encodeURIComponent(safeName)}.pdf`,
+    "Cache-Control": "private, no-store",
   })
-  res.send(pdfBuf)
+  res.send(pdf)
 }
 
 // ── GET /api/marks/report-card/:studentId — generate student report card PDF ──
-router.get("/report-card/:studentId", async (req: AuthRequest, res: Response) => {
-  if (req.userRole === "student") {
-    return void res.status(403).json({ error: "Not available for students via this endpoint" })
+// Staff only: an admin of the school, or a teacher who teaches the student's class.
+// Parents and students never use this route (students have /my-report-card).
+const REPORT_CARD_STAFF = new Set(["teacher", "admin", "super_admin"])
+
+router.get("/report-card/:studentId", reportCardLimit, async (req: AuthRequest, res: Response) => {
+  if (!REPORT_CARD_STAFF.has(req.userRole ?? "")) {
+    return void res.status(403).json({ error: "Only school staff can download report cards here" })
   }
-  const user = await User.findById(req.userId).select("school_id").lean()
-  if (!user) return void res.status(401).json({ error: "User not found" })
-
-  const student = await User.findOne({
-    _id: req.params.studentId,
-    school_id: user.school_id,
-    role: "student",
-    is_active: true,
-  }).select("name class_id school_id").lean()
-  if (!student) return void res.status(404).json({ error: "Student not found" })
-
-  const studentIdStr = String(req.params.studentId)
-  const data = await fetchReportCardData(
-    { name: student.name, class_id: student.class_id, school_id: user.school_id as mongoose.Types.ObjectId },
-    studentIdStr,
-  )
-  const html = buildReportCardHTML(data)
-  const safeName = (student.name as string).replace(/[^a-z0-9]/gi, "-").replace(/-+/g, "-")
+  if (!validateObjectId(req.params.studentId, res, "student ID")) return
   try {
-    await sendReportCardPdf(res, html, safeName, req.userId!)
-  } catch {
-    res.status(500).json({ error: "Failed to generate report card. Please try again." })
+    const user = await User.findById(req.userId).select("school_id").lean()
+    if (!user?.school_id) return void res.status(401).json({ error: "User not found" })
+
+    const student = await User.findOne({
+      _id: req.params.studentId,
+      school_id: user.school_id,
+      role: "student",
+      is_active: true,
+    }).select("name class_id school_id").lean()
+    if (!student) return void res.status(404).json({ error: "Student not found" })
+
+    if (req.userRole === "teacher") {
+      const teachesClass = student.class_id && await Class.exists({
+        _id: student.class_id,
+        school_id: user.school_id,
+        $or: [{ teacher_id: req.userId }, { "teachers.teacher_id": req.userId }],
+      })
+      if (!teachesClass) return void res.status(403).json({ error: "You can only download report cards for classes you teach" })
+    }
+
+    // Always the stored id (never the request text), so the cache key is one per student
+    const studentIdStr = student._id.toString()
+    const data = await fetchReportCardData(
+      { name: student.name, class_id: student.class_id, school_id: user.school_id },
+      studentIdStr,
+    )
+    const html = buildReportCardHTML(data)
+    const safeName = student.name.replace(/[^a-z0-9]/gi, "-").replace(/-+/g, "-")
+    await sendReportCardPdf(res, html, safeName, {
+      schoolId: user.school_id.toString(), studentId: studentIdStr, requestedBy: req.userId!,
+    })
+  } catch (err) {
+    logger.error({ err }, "[marks/report-card]")
+    if (!res.headersSent) res.status(500).json({ error: "Failed to generate report card. Please try again." })
   }
 })
 
 // ── GET /api/marks/my-report-card — student downloads own report card ─────────
-router.get("/my-report-card", async (req: AuthRequest, res: Response) => {
+router.get("/my-report-card", reportCardLimit, async (req: AuthRequest, res: Response) => {
   if (req.userRole !== "student") return void res.status(403).json({ error: "Students only" })
-
-  const student = await User.findOne({
-    _id:       req.userId,
-    role:      "student",
-    is_active: true,
-  }).select("name class_id school_id").lean()
-  if (!student) return void res.status(404).json({ error: "Student not found" })
-
-  const data2 = await fetchReportCardData(
-    { name: student.name, class_id: student.class_id, school_id: student.school_id },
-    req.userId!,
-  )
-  const html2 = buildReportCardHTML(data2)
-  const safeName2 = (student.name as string).replace(/[^a-z0-9]/gi, "-").replace(/-+/g, "-")
   try {
-    await sendReportCardPdf(res, html2, safeName2, req.userId!)
-  } catch {
-    res.status(500).json({ error: "Failed to generate report card. Please try again." })
+    const student = await User.findOne({
+      _id:       req.userId,
+      role:      "student",
+      is_active: true,
+    }).select("name class_id school_id").lean()
+    if (!student?.school_id) return void res.status(404).json({ error: "Student not found" })
+
+    const studentIdStr = student._id.toString()
+    const data = await fetchReportCardData(
+      { name: student.name, class_id: student.class_id, school_id: student.school_id },
+      studentIdStr,
+    )
+    const html = buildReportCardHTML(data)
+    const safeName = student.name.replace(/[^a-z0-9]/gi, "-").replace(/-+/g, "-")
+    await sendReportCardPdf(res, html, safeName, {
+      schoolId: student.school_id.toString(), studentId: studentIdStr, requestedBy: req.userId!,
+    })
+  } catch (err) {
+    logger.error({ err }, "[marks/my-report-card]")
+    if (!res.headersSent) res.status(500).json({ error: "Failed to generate report card. Please try again." })
   }
 })
 

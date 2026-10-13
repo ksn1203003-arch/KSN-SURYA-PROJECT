@@ -15,8 +15,13 @@ import { TeacherSession } from "../models/TeacherSession.js"
 import { Module } from "../models/Module.js"
 import { ModuleProgress } from "../models/ModuleProgress.js"
 import { Attendance } from "../models/Attendance.js"
+import { StudentEnrollment } from "../models/StudentEnrollment.js"
 import { todayIST, weekStartIST, academicYearStartIST } from "../lib/dateHelpers.js"
-import { calculateAttendanceRate } from "../lib/attendanceHelpers.js"
+import {
+  calculateAttendanceRate, attendanceDateFilter, classLabelOf, countedFields, floorFrom, isYmd, loadCountedClass,
+  type CountedClass,
+} from "../lib/attendanceHelpers.js"
+import { validateObjectId } from "../lib/validateId.js"
 
 const router = Router()
 router.use(requireAuth)
@@ -35,6 +40,37 @@ async function resolveTeacher(userId: string): Promise<{ teacher: TeacherInfo } 
 
 const ATT_EMPTY = { total: 0, present: 0, absent: 0, late: 0, rate: 0, recorded: false }
 
+// The class a reader counts attendance for: its stored school-year start (a real YYYY-MM-DD, else null = every sheet
+// counts) and its label. Used where the class document is already loaded and checked against the caller's school.
+function countedClassOf(cls: { grade: number; section: string; name?: string | null; year_start?: unknown }): CountedClass {
+  return { start: isYmd(cls.year_start) ? cls.year_start : null, label: classLabelOf(cls) }
+}
+
+// ── School-year start gate for attendance ─────────────────────────────────────
+// A sheet can be saved only for a class that has a STORED school-year start (the default start the admin list shows
+// for an older class does not count), and never for a day before that start. This holds for every role.
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// "2026-06-01" -> "1 Jun 2026"
+function formatLongDate(ymd: string): string {
+  return `${Number(ymd.slice(8, 10))} ${MONTH_NAMES[Number(ymd.slice(5, 7)) - 1]} ${ymd.slice(0, 4)}`
+}
+
+interface StartGateRefusal { status: 400 | 409; body: { error: string; code: string } }
+
+function startDateGate(storedStart: unknown, date: string): StartGateRefusal | null {
+  if (typeof storedStart !== "string") {
+    return { status: 409, body: { error: "The school year start of this class is not set yet. Please ask your school admin.", code: "start_date_not_set" } }
+  }
+  if (date < storedStart) {
+    return {
+      status: 400,
+      body: { error: `This date is before the class's school year starts (${formatLongDate(storedStart)}). Pick a date on or after it.`, code: "before_start_date" },
+    }
+  }
+  return null
+}
+
 // ── POST /api/teacher/attendance ──────────────────────────────────────────────
 
 router.post("/attendance", async (req: AuthRequest, res: Response) => {
@@ -48,6 +84,10 @@ router.post("/attendance", async (req: AuthRequest, res: Response) => {
 
   if (!class_id || !date || !period || !Array.isArray(records) || !records.length) {
     res.status(400).json({ error: "class_id, date, period, and records[] are required" }); return
+  }
+  if (typeof class_id !== "string" || typeof date !== "string" ||
+      !records.every(r => r !== null && typeof r === "object" && typeof r.student_id === "string")) {
+    res.status(400).json({ error: "class_id, date and every student_id must be plain text" }); return
   }
   if (records.length > 500) {
     res.status(400).json({ error: "records[] cannot exceed 500 entries" }); return
@@ -96,10 +136,14 @@ router.post("/attendance", async (req: AuthRequest, res: Response) => {
       }
     }
 
+    // The class needs a stored school-year start, and the date may not be before it (every role, admins included).
+    const gate = startDateGate(cls.year_start, date)
+    if (gate) { res.status(gate.status).json(gate.body); return }
+
     // Prevent overwriting another teacher's attendance record
     const existing = await Attendance.findOne({
       class_id: new mongoose.Types.ObjectId(class_id), date, period
-    }).select("teacher_id").lean() as { teacher_id?: { toString(): string } } | null
+    }).select("teacher_id records.student_id").lean() as { teacher_id?: { toString(): string }; records?: Array<{ student_id?: { toString(): string } }> } | null
 
     if (existing && existing.teacher_id && existing.teacher_id.toString() !== req.userId!) {
       // Another teacher already marked attendance for this period — allow admins to overwrite
@@ -108,17 +152,67 @@ router.post("/attendance", async (req: AuthRequest, res: Response) => {
       }
     }
 
+    // ── Every student on the sheet must belong to this class and school ───────
+    // Names come from the student's own record, never from the browser. A student who is
+    // already on the saved sheet may stay on it when the sheet is corrected.
+    const sheetIds = records.map(r => r.student_id.toLowerCase())
+    if (!sheetIds.every(id => /^[0-9a-fA-F]{24}$/.test(id))) {
+      res.status(400).json({ error: "One of the student ids on the sheet is not valid" }); return
+    }
+    if (new Set(sheetIds).size !== sheetIds.length) {
+      res.status(400).json({ error: "A student appears more than once on the sheet" }); return
+    }
+    const schoolObjectId = new mongoose.Types.ObjectId(ctx.teacher.school_id)
+    const sheetStudents = await User.find({
+      _id: { $in: sheetIds.map(id => new mongoose.Types.ObjectId(id)) },
+      school_id: schoolObjectId,
+      role: "student",
+    }).select("name class_id is_active").lean()
+    if (sheetStudents.length !== sheetIds.length) {
+      res.status(400).json({ error: "One or more students are not in your school" }); return
+    }
+    const alreadyOnSheet = new Set((existing?.records ?? []).map(r => String(r.student_id)))
+    const newcomers = sheetStudents.filter(s => !alreadyOnSheet.has(String(s._id)))
+    if (newcomers.some(s => !s.is_active)) {
+      res.status(400).json({ error: "An inactive student cannot be added to the sheet" }); return
+    }
+    if (newcomers.length) {
+      const historyLines = await StudentEnrollment.find({
+        school_id: schoolObjectId,
+        student_id: { $in: newcomers.map(s => s._id) },
+      }).select("student_id class_id from_date to_date").lean()
+      const belongsOnDate = (studentId: string, currentClassId: string | undefined): boolean => {
+        const own = historyLines.filter(l => String(l.student_id) === studentId)
+        // No history yet (added before class history existed): the current class decides.
+        if (own.length === 0) return currentClassId === class_id.toLowerCase()
+        return own.some(l => String(l.class_id) === class_id.toLowerCase() && l.from_date <= date && (l.to_date === null || l.to_date >= date))
+      }
+      if (newcomers.some(s => !belongsOnDate(String(s._id), s.class_id?.toString()))) {
+        res.status(400).json({ error: "One or more students were not in this class on that date" }); return
+      }
+    }
+    const nameById = new Map(sheetStudents.map(s => [String(s._id), s.name]))
+
+    // One fresh read of the class's stored start date right before the write, so a date change that was committed
+    // after the check above is honoured too. This is a plain read followed by a plain write, not a transaction: a save
+    // that lands in the same few milliseconds as a date change can still be written. Which sheets count for a school
+    // year is decided by the code that reads attendance (a later step), not by this write.
+    const classObjectId = new mongoose.Types.ObjectId(class_id)
+    const latest = await Class.findOne({ _id: classObjectId, school_id: schoolObjectId })
+      .select("year_start").lean<{ year_start?: string | null } | null>()
+    const lateGate = startDateGate(latest?.year_start, date)
+    if (lateGate) { res.status(lateGate.status).json(lateGate.body); return }
     await Attendance.findOneAndUpdate(
-      { class_id: new mongoose.Types.ObjectId(class_id), date, period },
+      { class_id: classObjectId, date, period },
       {
         $set: {
           school_id:  ctx.teacher.school_id,
           teacher_id: new mongoose.Types.ObjectId(req.userId!),
-          class_id:   new mongoose.Types.ObjectId(class_id),
+          class_id:   classObjectId,
           date, period, subject: subject ?? "",
           records: records.map(r => ({
             student_id:   new mongoose.Types.ObjectId(r.student_id),
-            student_name: r.student_name,
+            student_name: nameById.get(r.student_id.toLowerCase()) ?? "",
             status:       r.status,
           })),
         },
@@ -162,6 +256,8 @@ router.get("/attendance", async (req: AuthRequest, res: Response) => {
 
 router.get("/attendance-stats", async (req: AuthRequest, res: Response) => {
   const SAFE = { class_total: { today: ATT_EMPTY, this_week: ATT_EMPTY, this_month: ATT_EMPTY, this_year: ATT_EMPTY }, students: [] }
+  // counted_from / counted_class_label: filled in once the class is known (null while it is not)
+  let countedBody = countedFields(null)
   try {
     const ctx = await resolveTeacher(req.userId!)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
@@ -171,13 +267,15 @@ router.get("/attendance-stats", async (req: AuthRequest, res: Response) => {
 
     const cls = await Class.findOne({ _id: class_id, school_id: new mongoose.Types.ObjectId(ctx.teacher.school_id) }).lean()
     if (!cls) { res.status(403).json({ error: "Class not found in your school" }); return }
+    const counted = countedClassOf(cls)
+    countedBody = countedFields(counted)
 
     const db = mongoose.connection.db
-    if (!db) { res.json(SAFE); return }
+    if (!db) { res.json({ ...SAFE, ...countedBody }); return }
 
     const studentDocs = await User.find({ class_id, role: "student", is_active: true })
       .select("_id name").sort("name").lean()
-    if (!studentDocs.length) { res.json(SAFE); return }
+    if (!studentDocs.length) { res.json({ ...SAFE, ...countedBody }); return }
 
     const studentIds = studentDocs.map(s => s._id as mongoose.Types.ObjectId)
     const classOid   = new mongoose.Types.ObjectId(class_id)
@@ -185,10 +283,13 @@ router.get("/attendance-stats", async (req: AuthRequest, res: Response) => {
     const weekStart  = weekStartIST()
     const monthStart = `${today.slice(0, 7)}-01`
     const yearStart  = academicYearStartIST()
+    // Every window (today, week, month, year) sits inside the year window, so flooring the year window at the
+    // class's stored start also keeps the shorter windows from reaching before it. A start in the future matches nothing.
+    const yearFloor  = floorFrom(counted.start, yearStart)
 
     // Single aggregation pass: group by student, conditional sums for each range
     const rows = await db.collection("attendances").aggregate([
-      { $match: { class_id: classOid, date: { $gte: yearStart, $lte: today } } },
+      { $match: { class_id: classOid, ...attendanceDateFilter(counted.start, yearFloor, today) } },
       { $match: { "records.student_id": { $in: studentIds } } },
       { $unwind: "$records" },
       { $match: { "records.student_id": { $in: studentIds } } },
@@ -261,10 +362,11 @@ router.get("/attendance-stats", async (req: AuthRequest, res: Response) => {
         this_year:  classSlot("this_year"),
       },
       students,
+      ...countedBody,
     })
   } catch (err) {
     logger.error({ err: err }, "[teacher/attendance-stats]")
-    res.json(SAFE)
+    res.json({ ...SAFE, ...countedBody })
   }
 })
 
@@ -274,6 +376,8 @@ router.get("/attendance-stats", async (req: AuthRequest, res: Response) => {
 
 router.get("/attendance-range", async (req: AuthRequest, res: Response) => {
   const SAFE = { class_total: ATT_EMPTY, students: [] as { student_id: string; name: string; slot: typeof ATT_EMPTY }[] }
+  // counted_from / counted_class_label: filled in once the class is known (null while it is not)
+  let countedBody = countedFields(null)
   try {
     const ctx = await resolveTeacher(req.userId!)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
@@ -295,19 +399,22 @@ router.get("/attendance-range", async (req: AuthRequest, res: Response) => {
 
     const cls = await Class.findOne({ _id: class_id, school_id: new mongoose.Types.ObjectId(ctx.teacher.school_id) }).lean()
     if (!cls) { res.status(403).json({ error: "Class not found in your school" }); return }
+    const counted = countedClassOf(cls)
+    countedBody = countedFields(counted)
 
     const db = mongoose.connection.db
-    if (!db) { res.json(SAFE); return }
+    if (!db) { res.json({ ...SAFE, ...countedBody }); return }
 
     const studentDocs = await User.find({ class_id, role: "student", is_active: true })
       .select("_id name").sort("name").lean()
-    if (!studentDocs.length) { res.json(SAFE); return }
+    if (!studentDocs.length) { res.json({ ...SAFE, ...countedBody }); return }
 
     const studentIds = studentDocs.map(s => s._id as mongoose.Types.ObjectId)
     const classOid   = new mongoose.Types.ObjectId(class_id)
 
+    // The requested range is clamped to the class's stored start: sheets before it are never counted.
     const rows = await db.collection("attendances").aggregate([
-      { $match: { class_id: classOid, date: { $gte: from, $lte: to } } },
+      { $match: { class_id: classOid, ...attendanceDateFilter(counted.start, floorFrom(counted.start, from), to) } },
       { $match: { "records.student_id": { $in: studentIds } } },
       { $unwind: "$records" },
       { $match: { "records.student_id": { $in: studentIds } } },
@@ -347,10 +454,10 @@ router.get("/attendance-range", async (req: AuthRequest, res: Response) => {
       return { ...acc, rate: calculateAttendanceRate(acc.present, acc.late, acc.total) ?? 0, recorded: true }
     })()
 
-    res.json({ class_total: classTotal, students, from, to })
+    res.json({ class_total: classTotal, students, from, to, ...countedBody })
   } catch (err) {
     logger.error({ err: err }, "[teacher/attendance-range]")
-    res.json(SAFE)
+    res.json({ ...SAFE, ...countedBody })
   }
 })
 
@@ -359,12 +466,17 @@ router.get("/attendance-range", async (req: AuthRequest, res: Response) => {
 
 router.get("/student-attendance", async (req: AuthRequest, res: Response) => {
   try {
-    const student = await User.findById(req.userId!).select("class_id role").lean()
+    const student = await User.findById(req.userId!).select("class_id school_id role").lean()
     if (!student) { res.status(404).json({ error: "User not found" }); return }
     if (student.role !== "student") { res.status(403).json({ error: "Student access only" }); return }
-    if (!student.class_id) { res.json({ records: [] }); return }
+    if (!student.class_id) { res.json({ records: [], ...countedFields(null) }); return }
 
-    const docs = await Attendance.find({ class_id: student.class_id })
+    // The student's own class, found inside the student's own school; only sheets from its stored start count.
+    // A class that cannot be found there gives an empty list (never "all sheets").
+    const counted = await loadCountedClass(student.class_id, student.school_id)
+    if (!counted) { res.json({ records: [], ...countedFields(null) }); return }
+
+    const docs = await Attendance.find({ class_id: student.class_id, ...attendanceDateFilter(counted.start) })
       .select("date period subject records")
       .sort({ date: 1, period: 1 })
       .lean() as unknown as Array<{
@@ -379,7 +491,7 @@ router.get("/student-attendance", async (req: AuthRequest, res: Response) => {
       return [{ date: doc.date, period: doc.period, subject: doc.subject, status: mine.status }]
     })
 
-    res.json({ records: result })
+    res.json({ records: result, ...countedFields(counted) })
   } catch (err) {
     logger.error({ err: err }, "[teacher/student-attendance]")
     res.status(500).json({ error: "Failed to load attendance" })
@@ -588,7 +700,7 @@ router.get("/my-classes", async (req: AuthRequest, res: Response) => {
       { "teachers.teacher_id": tid },
       { "timetable.teacher_id": tid },
     ],
-  }).select("grade section name subjects timetable timetable_updated_by_name timetable_updated_at").lean()
+  }).select("grade section name subjects year_start timetable timetable_updated_by_name timetable_updated_at").lean()
 
   // resolve all teacher_ids across all class timetables into names
   const allTeacherIds = [...new Set(
@@ -606,6 +718,8 @@ router.get("/my-classes", async (req: AuthRequest, res: Response) => {
       section: c.section,
       name: c.name ?? null,
       subjects: c.subjects ?? [],
+      year_start: typeof c.year_start === "string" ? c.year_start : null,
+      has_start_date: typeof c.year_start === "string",
       timetable: (c.timetable ?? []).map(s => ({
         day: s.day, period: s.period, subject: s.subject,
         teacher_id: s.teacher_id?.toString() ?? null,
@@ -888,27 +1002,43 @@ router.get("/student-progress", async (req: AuthRequest, res: Response) => {
     const ctx = await resolveTeacher(req.userId!)
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
 
-    const { class_id } = req.query as { class_id?: string }
+    const { class_id } = req.query as { class_id?: unknown }
     if (!class_id) { res.status(400).json({ error: "class_id is required" }); return }
+    if (typeof class_id !== "string") { res.status(400).json({ error: "Invalid class_id" }); return }
+    if (!validateObjectId(class_id, res, "class_id")) return
 
-    const cls = await Class.findOne({ _id: class_id, school_id: new mongoose.Types.ObjectId(ctx.teacher.school_id) }).select("_id").lean()
-    if (!cls) { res.status(403).json({ error: "Class not found in your school" }); return }
+    const schoolId = new mongoose.Types.ObjectId(ctx.teacher.school_id)
+    const classId  = new mongoose.Types.ObjectId(class_id)
+    // Admins see any class in their school; a teacher only the classes they teach
+    const cls = await Class.findOne({
+      _id: classId,
+      school_id: schoolId,
+      ...(ctx.teacher.role === "teacher" ? { $or: [{ teacher_id: req.userId }, { "teachers.teacher_id": req.userId }] } : {}),
+    }).select("year_start").lean()
+    if (!cls) { res.status(403).json({ error: "You can only see progress for classes you teach" }); return }
+    // Attendance % counts only sheets on/after the class's stored school-year start (null = every sheet)
+    const countedStart = isYmd(cls.year_start) ? cls.year_start : null
 
-    const studentDocs = await User.find({ class_id, role: "student" }).select("_id").lean()
+    const [studentDocs, modules] = await Promise.all([
+      User.find({ class_id: classId, school_id: schoolId, role: "student", is_active: true }).select("_id").lean(),
+      // Only the item ids: enough to count items and to match progress, without file details
+      Module.find({ class_id: classId, school_id: schoolId }).select("items._id").lean(),
+    ])
     if (!studentDocs.length) { res.json({ progress: [] }); return }
     const studentIds = studentDocs.map(s => s._id as mongoose.Types.ObjectId)
+    const moduleIds  = modules.map(m => m._id)
+    const itemIds    = modules.flatMap(m => m.items.map(i => i._id))
 
-    const [modules, progressDocs, attDocs] = await Promise.all([
-      // 1. Total module items in this class
-      Module.find({ class_id }).select("items").lean(),
-      // 2. Items viewed per student
-      ModuleProgress.aggregate([
-        { $match: { student_id: { $in: studentIds } } },
+    const [progressDocs, attDocs] = await Promise.all([
+      // Items viewed per student, counting only items in this class's lessons today,
+      // so a student moved from another class (or a deleted item) never counts twice
+      itemIds.length === 0 ? Promise.resolve([]) : ModuleProgress.aggregate([
+        { $match: { student_id: { $in: studentIds }, module_id: { $in: moduleIds }, item_id: { $in: itemIds } } },
         { $group: { _id: "$student_id", viewed: { $sum: 1 } } },
       ]),
-      // 3. Attendance records — aggregated per student directly in MongoDB to avoid loading all records into memory
+      // Attendance records — aggregated per student directly in MongoDB to avoid loading all records into memory
       Attendance.aggregate([
-        { $match: { class_id: new mongoose.Types.ObjectId(class_id) } },
+        { $match: { class_id: classId, ...attendanceDateFilter(countedStart) } },
         { $unwind: "$records" },
         { $group: {
           _id:     "$records.student_id",
@@ -919,7 +1049,7 @@ router.get("/student-progress", async (req: AuthRequest, res: Response) => {
       ]),
     ])
 
-    const totalItems = modules.reduce((sum, m) => sum + ((m.items as unknown[])?.length ?? 0), 0)
+    const totalItems = itemIds.length
 
     const viewedMap: Record<string, number> = {}
     progressDocs.forEach((d: { _id: mongoose.Types.ObjectId; viewed: number }) => {

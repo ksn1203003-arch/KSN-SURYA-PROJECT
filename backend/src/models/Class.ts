@@ -40,6 +40,8 @@ export interface IClass extends Document {
   timetable_updated_by_id: mongoose.Types.ObjectId | null
   timetable_updated_by_name: string | null
   timetable_updated_at: Date | null
+  year_start: string | null                    // YYYY-MM-DD the class's school year begins; null = not stored (older class)
+  year_start_set_at: Date | null               // when year_start was last saved (decides the 7-day correction window)
   created_at: Date
 }
 
@@ -77,6 +79,8 @@ const classSchema = new mongoose.Schema<IClass>({
   timetable_updated_by_id:   { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
   timetable_updated_by_name: { type: String, default: null },
   timetable_updated_at:      { type: Date, default: null },
+  year_start:                { type: String, default: null },
+  year_start_set_at:         { type: Date, default: null },
   created_at: { type: Date, default: Date.now },
 })
 

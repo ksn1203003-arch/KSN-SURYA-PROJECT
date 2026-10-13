@@ -10,10 +10,13 @@ import { randomBytes } from "crypto"
 import zxcvbn from "zxcvbn"
 import { User } from "../models/User.js"
 import { Class } from "../models/Class.js"
+import { AuditLog } from "../models/AuditLog.js"
+import { openEnrollment, changeEnrollment, runInTransaction } from "../models/StudentEnrollment.js"
 import mongoose from "mongoose"
 import { requireAuth, type AuthRequest } from "../middleware/auth.js"
 import { withRetry } from "../lib/retry.js"
 import { sendEmail } from "../lib/email.js"
+import { MAX_PHOTO_DATA_URL_LENGTH, decodePhoto } from "../lib/userPhoto.js"
 
 const router = Router()
 
@@ -39,6 +42,45 @@ async function requireAdminCaller(req: Request): Promise<{ callerSchoolId: strin
   }
   if (!caller.school_id) return { error: "No school associated with this account", status: 400 }
   return { callerSchoolId: caller.school_id.toString() }
+}
+
+function isObjectIdString(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-fA-F]{24}$/.test(value)
+}
+
+function isDuplicateKeyError(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: number }).code === 11000
+}
+
+const STUDENT_GONE = "STUDENT_NOT_FOUND"
+
+// The class name as the admin screens show it: "Class 5A" for a numbered class, otherwise its own name, otherwise its section.
+// It is saved on every new class-history line, so the history keeps the name the class had at the time.
+function classLabelOf(cls: { grade: number; section: string; name?: string | null }): string {
+  return cls.grade > 0 ? `Class ${cls.grade}${cls.section}` : (cls.name ?? cls.section)
+}
+
+// Records a class change in the audit log. It holds ids, counts and the caller's IP only — no names.
+// A failure to write the entry is logged and never fails the admin's action.
+async function writeClassChangeAudit(
+  req: Request, schoolId: string, action: string, resourceType: string, resourceId: string, after: Record<string, unknown>,
+): Promise<void> {
+  try {
+    const authReq = req as AuthRequest
+    await AuditLog.create({
+      school_id:     new mongoose.Types.ObjectId(schoolId),
+      actor_id:      new mongoose.Types.ObjectId(authReq.userId!),
+      actor_role:    authReq.userRole ?? "admin",
+      action,
+      resource_type: resourceType,
+      resource_id:   resourceId,
+      before:        null,
+      after,
+      ip:            req.ip ?? null,
+    })
+  } catch (auditErr) {
+    logger.error({ err: auditErr }, "[users] Failed to write AuditLog entry — action still succeeded")
+  }
 }
 
 // ── POST /api/users/invite-teacher ───────────────────────────────────────────
@@ -143,18 +185,29 @@ router.post("/add-student", async (req: Request, res: Response) => {
     const existing = await User.findOne({ $or: [{ email: resolvedEmail }, { username }] }).select("_id").lean()
     if (existing) { res.status(400).json({ error: `Account with email or username "${username}" already exists.` }); return }
 
-    await User.create({
-      name,
-      email: resolvedEmail,
-      phone: phone ?? null,
-      gender: gender ?? null,
-      username,
-      password_hash: hash,
-      role: "student",
-      school_id: new mongoose.Types.ObjectId(callerSchoolId),
-      class_id: new mongoose.Types.ObjectId(class_id),
-      is_active: true,
-      must_change_password: true,
+    // The student and the first class-history line are saved together.
+    await runInTransaction(async (session) => {
+      const [created] = await User.create([{
+        name,
+        email: resolvedEmail,
+        phone: phone ?? null,
+        gender: gender ?? null,
+        username,
+        password_hash: hash,
+        role: "student",
+        school_id: new mongoose.Types.ObjectId(callerSchoolId),
+        class_id: new mongoose.Types.ObjectId(class_id),
+        is_active: true,
+        must_change_password: true,
+      }], { session })
+      await openEnrollment({
+        schoolId:  new mongoose.Types.ObjectId(callerSchoolId),
+        studentId: created._id,
+        classId:   new mongoose.Types.ObjectId(class_id),
+        createdBy: new mongoose.Types.ObjectId((req as AuthRequest).userId!),
+        classLabel: classLabelOf(cls),
+        session,
+      })
     })
 
     // temp_password is returned here intentionally — admin distributes it to students on paper.
@@ -218,21 +271,36 @@ router.post("/bulk-students", async (req: Request, res: Response) => {
       const username = s.roll_no.toLowerCase().replace(/\s/g, "")
       const password = passwords[idx]
       try {
-        await User.create({
-          name: s.name,
-          email: resolvedEmail,
-          phone: s.phone ?? null,
-          username,
-          password_hash: hashed[idx],
-          role: "student",
-          school_id: new mongoose.Types.ObjectId(callerSchoolId),
-          class_id: new mongoose.Types.ObjectId(class_id),
-          is_active: true,
-          must_change_password: true,
+        await runInTransaction(async (session) => {
+          const [created] = await User.create([{
+            name: s.name,
+            email: resolvedEmail,
+            phone: s.phone ?? null,
+            username,
+            password_hash: hashed[idx],
+            role: "student",
+            school_id: new mongoose.Types.ObjectId(callerSchoolId),
+            class_id: new mongoose.Types.ObjectId(class_id),
+            is_active: true,
+            must_change_password: true,
+          }], { session })
+          await openEnrollment({
+            schoolId:  new mongoose.Types.ObjectId(callerSchoolId),
+            studentId: created._id,
+            classId:   new mongoose.Types.ObjectId(class_id),
+            createdBy: new mongoose.Types.ObjectId((req as AuthRequest).userId!),
+            classLabel: classLabelOf(cls),
+            session,
+          })
         })
         results.push({ name: s.name, username, temp_password: password })
-      } catch {
-        results.push({ name: s.name, username, temp_password: "", error: "Username or email already exists" })
+      } catch (err) {
+        if (isDuplicateKeyError(err)) {
+          results.push({ name: s.name, username, temp_password: "", error: "Username or email already exists" })
+        } else {
+          logger.error({ err }, "[users] bulk-students could not add a student")
+          results.push({ name: s.name, username, temp_password: "", error: "Could not add this student. Please try again." })
+        }
       }
     }
 
@@ -347,11 +415,19 @@ router.patch("/profile", async (req: Request, res: Response) => {
   if (phone !== undefined) updates.phone = phone || null
   if (preferred_language && ["english", "hindi"].includes(preferred_language)) updates.preferred_language = preferred_language
   if (profile_photo_url !== undefined) {
+    if (profile_photo_url !== null && profile_photo_url !== "" && typeof profile_photo_url !== "string") {
+      res.status(400).json({ error: "Please choose a PNG, JPEG, WebP or GIF picture." }); return
+    }
     // LOW-28: cap photo size to prevent large base64 strings bloating the DB
-    if (profile_photo_url && typeof profile_photo_url === "string" && profile_photo_url.length > 150_000) {
+    if (profile_photo_url && profile_photo_url.length > MAX_PHOTO_DATA_URL_LENGTH) {
       res.status(400).json({ error: "Profile photo is too large. Please use a smaller image." }); return
     }
+    // Photos are served back as pictures, so only plain image data is accepted
+    if (profile_photo_url && !decodePhoto(profile_photo_url)) {
+      res.status(400).json({ error: "Please choose a PNG, JPEG, WebP or GIF picture." }); return
+    }
     updates.profile_photo_url = profile_photo_url || null
+    updates.profile_photo_updated_at = profile_photo_url ? new Date() : null
   }
   if (current_password && new_password) {
     if (new_password.length < 8) { res.status(400).json({ error: "New password must be at least 8 characters." }); return }
@@ -560,14 +636,16 @@ router.patch("/student/:id", async (req: Request, res: Response) => {
     const { callerSchoolId } = ctx
 
     const { id } = req.params
-    // Verify target student belongs to caller's school
-    const target = await User.findById(id).select("school_id").lean()
-    if (!target || target.school_id?.toString() !== callerSchoolId) {
-      res.status(403).json({ error: "Forbidden" }); return
-    }
+    if (!isObjectIdString(id)) { res.status(400).json({ error: "Invalid student id" }); return }
+    // The target must be a student of the caller's school (same answer for "not found" and "other school")
+    const target = await User.findOne({ _id: id, school_id: callerSchoolId, role: "student" }).select("class_id is_active").lean()
+    if (!target) { res.status(404).json({ error: "Student not found" }); return }
 
     const { name, email, phone, gender, class_id } = req.body as {
       name?: string; email?: string; phone?: string; gender?: string; class_id?: string
+    }
+    if ([name, email, phone, gender, class_id].some(v => v !== undefined && typeof v !== "string")) {
+      res.status(400).json({ error: "Invalid request" }); return
     }
     if (name && name.trim().length > 100) {
       res.status(400).json({ error: "Name must be under 100 characters" }); return
@@ -583,24 +661,64 @@ router.patch("/student/:id", async (req: Request, res: Response) => {
     }
     const updates: Record<string, unknown> = {}
     if (name?.trim()) updates.name = name.trim()
-    if (email !== undefined) updates.email = email || null
+    // An empty email box means "leave the email as it is": the field is required and unique, so it is never set to null.
+    if (email) updates.email = email
     if (phone !== undefined) updates.phone = phone || null
     if (gender !== undefined) updates.gender = gender || null
+    let classChanged = false
+    let targetClassLabel: string | null = null
     if (class_id) {
+      if (!isObjectIdString(class_id)) { res.status(400).json({ error: "Invalid class id" }); return }
       // Verify new class belongs to caller's school
       const cls = await Class.findOne({ _id: class_id, school_id: callerSchoolId })
       if (!cls) { res.status(403).json({ error: "Target class not found in your school" }); return }
-      updates.class_id = new mongoose.Types.ObjectId(class_id)
+      targetClassLabel = classLabelOf(cls)
+      classChanged = target.class_id?.toString() !== class_id.toLowerCase()
+      if (classChanged && !target.is_active) {
+        res.status(400).json({ error: "An inactive student cannot be moved to another class." }); return
+      }
+      if (classChanged) updates.class_id = new mongoose.Types.ObjectId(class_id)
     }
 
-    const user = await User.findByIdAndUpdate(id, { $set: updates }, { returnDocument: "after" })
-      .select("name email phone username gender class_id is_active")
-    if (!user) { res.status(404).json({ error: "Student not found" }); return }
+    // A class change writes the class-history line and the new class together (or not at all).
+    const applyUpdate = async (session: mongoose.ClientSession | undefined) => {
+      if (classChanged) {
+        await changeEnrollment({
+          schoolId:  new mongoose.Types.ObjectId(callerSchoolId),
+          studentId: new mongoose.Types.ObjectId(id),
+          classId:   new mongoose.Types.ObjectId(String(class_id)),
+          createdBy: new mongoose.Types.ObjectId((req as AuthRequest).userId!),
+          reason:    "transferred",
+          classLabel: targetClassLabel,
+          session,
+        })
+      }
+      const updated = await User.findOneAndUpdate(
+        { _id: id, school_id: callerSchoolId, role: "student" },
+        { $set: updates },
+        { returnDocument: "after", session },
+      ).select("name email phone username gender class_id is_active")
+      // Throwing here rolls back the class-history line written above.
+      if (!updated) throw new Error(STUDENT_GONE)
+      return updated
+    }
+    let user: Awaited<ReturnType<typeof applyUpdate>>
+    try {
+      user = classChanged ? await runInTransaction(applyUpdate) : await applyUpdate(undefined)
+    } catch (err) {
+      if (err instanceof Error && err.message === STUDENT_GONE) { res.status(404).json({ error: "Student not found" }); return }
+      throw err
+    }
+    if (classChanged) {
+      await writeClassChangeAudit(req, callerSchoolId, "student.class_changed", "User", id, {
+        student_id: id, from_class_id: target.class_id?.toString() ?? null, to_class_id: String(class_id), moved: 1,
+      })
+    }
 
     let class_label: string | null = null
     if (user.class_id) {
-      const cls = await Class.findById(user.class_id).select("grade section")
-      if (cls) class_label = `Class ${cls.grade}${cls.section}`
+      const cls = await Class.findById(user.class_id).select("grade section name")
+      if (cls) class_label = cls.grade > 0 ? `Class ${cls.grade}${cls.section}` : (cls.name ?? cls.section)
     }
 
     res.json({
@@ -698,9 +816,15 @@ router.patch("/bulk-transfer", async (req: Request, res: Response) => {
     if ("error" in ctx) { res.status(ctx.status).json({ error: ctx.error }); return }
     const { callerSchoolId } = ctx
 
-    const { student_ids, class_id } = req.body as { student_ids: string[]; class_id: string }
-    if (!student_ids?.length || !class_id) {
+    const { student_ids, class_id, from_class_id } = req.body as { student_ids: string[]; class_id: string; from_class_id?: string }
+    if (!Array.isArray(student_ids) || !student_ids.length || !class_id) {
       res.status(400).json({ error: "student_ids[] and class_id are required" }); return
+    }
+    if (student_ids.length > 200) {
+      res.status(400).json({ error: "You can move at most 200 students at a time." }); return
+    }
+    if (!student_ids.every(isObjectIdString) || !isObjectIdString(class_id) || (from_class_id !== undefined && !isObjectIdString(from_class_id))) {
+      res.status(400).json({ error: "Invalid student or class id" }); return
     }
 
     // Verify target class belongs to caller's school
@@ -708,14 +832,50 @@ router.patch("/bulk-transfer", async (req: Request, res: Response) => {
     if (!cls) { res.status(403).json({ error: "Target class not found in your school" }); return }
 
     const schoolObjectId = new mongoose.Types.ObjectId(callerSchoolId)
-    // Only transfer students that belong to the caller's school
-    const objectIds = student_ids.map(id => new mongoose.Types.ObjectId(id))
-    await User.updateMany(
-      { _id: { $in: objectIds }, role: "student", school_id: schoolObjectId },
-      { $set: { class_id: new mongoose.Types.ObjectId(class_id) } }
-    )
-    const class_label = `Class ${cls.grade}${cls.section}`
-    res.json({ success: true, class_id, class_label })
+    const targetClassId = new mongoose.Types.ObjectId(class_id)
+    const uniqueIds = [...new Set(student_ids.map(id => id.toLowerCase()))]
+    // Only active students of the caller's school can move; every other id is reported as skipped.
+    const found = await User.find({
+      _id: { $in: uniqueIds.map(id => new mongoose.Types.ObjectId(id)) },
+      role: "student",
+      school_id: schoolObjectId,
+      is_active: true,
+    }).select("class_id").lean()
+    const foundIds = new Set(found.map(s => String(s._id)))
+    const skipped: Array<{ id: string; reason: "not_found_or_inactive" | "already_in_class" | "not_in_from_class" }> = []
+    for (const id of uniqueIds) {
+      if (!foundIds.has(id)) skipped.push({ id, reason: "not_found_or_inactive" })
+    }
+    const toMove: mongoose.Types.ObjectId[] = []
+    for (const s of found) {
+      const currentClass = s.class_id?.toString()
+      if (currentClass === class_id.toLowerCase()) { skipped.push({ id: String(s._id), reason: "already_in_class" }); continue }
+      if (from_class_id !== undefined && currentClass !== from_class_id.toLowerCase()) { skipped.push({ id: String(s._id), reason: "not_in_from_class" }); continue }
+      toMove.push(s._id)
+    }
+
+    if (toMove.length) {
+      const adminId = new mongoose.Types.ObjectId((req as AuthRequest).userId!)
+      // The class-history lines and the new class are saved together (or not at all).
+      const targetLabel = classLabelOf(cls)
+      await runInTransaction(async (session) => {
+        for (const studentId of toMove) {
+          await changeEnrollment({ schoolId: schoolObjectId, studentId, classId: targetClassId, createdBy: adminId, reason: "transferred", classLabel: targetLabel, session })
+        }
+        await User.updateMany(
+          { _id: { $in: toMove }, role: "student", school_id: schoolObjectId, is_active: true },
+          { $set: { class_id: targetClassId } },
+          { session },
+        )
+      })
+      await writeClassChangeAudit(req, callerSchoolId, "students.class_changed", "Class", class_id, {
+        to_class_id: class_id, from_class_id: from_class_id ?? null,
+        moved: toMove.length, moved_ids: toMove.map(String),
+        skipped: skipped.length, skipped_ids: skipped.map(s => s.id),
+      })
+    }
+    const class_label = cls.grade > 0 ? `Class ${cls.grade}${cls.section}` : (cls.name ?? cls.section)
+    res.json({ success: true, class_id, class_label, moved: toMove.length, moved_ids: toMove.map(String), skipped })
   } catch (err) {
     logger.error({ err: err }, "[users]")
     res.status(500).json({ error: "An unexpected error occurred. Please try again." })

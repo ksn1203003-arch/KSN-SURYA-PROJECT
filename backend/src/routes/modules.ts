@@ -5,7 +5,7 @@ import { logger } from "../lib/logger.js"
 // PPTX→PDF conversion via LibreOffice, link additions, reordering, and
 // per-student viewed-item tracking.
 // ─────────────────────────────────────────────────────────────────────────────
-import { Router, type Response } from "express"
+import { Router, type Response, type NextFunction } from "express"
 import multer from "multer"
 import mongoose from "mongoose"
 import { promisify } from "util"
@@ -22,7 +22,7 @@ import { Class } from "../models/Class.js"
 import { School, PLAN_STORAGE_QUOTAS } from "../models/School.js"
 import { getGridFSBucket } from "../lib/gridfs.js"
 import { validateObjectId } from "../lib/validateId.js"
-import { queuePptxConversion } from "../jobs/queue.js"
+import { queuePptxConversion, getPptxQueue, type PptxJobData } from "../jobs/queue.js"
 
 const require = createRequire(import.meta.url)
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -131,15 +131,17 @@ async function canWriteModule(userId: string, moduleId: string | string[]): Prom
 // Returns module count per subject for a class (used by subject grid cards)
 router.get("/counts", async (req: AuthRequest, res: Response) => {
   try {
-    const { class_id } = req.query as Record<string, string>
-    if (!class_id) { res.status(400).json({ error: "class_id required" }); return }
+    const { class_id } = req.query
+    if (!class_id || typeof class_id !== "string") { res.status(400).json({ error: "class_id required" }); return }
+    if (!validateObjectId(class_id, res, "class_id")) return
 
     const schoolId = await resolveSchoolId(req.userId!)
     if (!schoolId) { res.status(400).json({ error: "No school" }); return }
 
-    // Verify class belongs to requester's school
+    // Verify class belongs to requester's school. A class in another school gets the same 404 as one
+    // that does not exist, so the endpoint cannot be used to probe other schools.
     const clsCheck = await mongoose.connection.db?.collection("classes").findOne({ _id: new mongoose.Types.ObjectId(class_id), school_id: new mongoose.Types.ObjectId(schoolId) })
-    if (!clsCheck) { res.status(403).json({ error: "Class not found in your school", counts: {} }); return }
+    if (!clsCheck) { res.status(404).json({ error: "Class not found", counts: {} }); return }
 
     const result = await Module.aggregate([
       { $match: { school_id: new mongoose.Types.ObjectId(schoolId), class_id: new mongoose.Types.ObjectId(class_id) } },
@@ -159,15 +161,19 @@ router.get("/counts", async (req: AuthRequest, res: Response) => {
 // Returns all modules for a class+subject, with student progress if caller is student
 router.get("/", async (req: AuthRequest, res: Response) => {
   try {
-    const { class_id, subject } = req.query as Record<string, string>
-    if (!class_id || !subject) { res.status(400).json({ error: "class_id and subject required" }); return }
+    const { class_id, subject } = req.query
+    if (!class_id || !subject || typeof class_id !== "string" || typeof subject !== "string") {
+      res.status(400).json({ error: "class_id and subject required" }); return
+    }
+    if (!validateObjectId(class_id, res, "class_id")) return
 
     const schoolId = await resolveSchoolId(req.userId!)
     if (!schoolId) { res.status(400).json({ error: "No school" }); return }
 
-    // Verify class belongs to requester's school
+    // Verify class belongs to requester's school. A class in another school gets the same
+    // 404 as a class that does not exist, so a deep link cannot be used to probe other schools.
     const clsCheck2 = await mongoose.connection.db?.collection("classes").findOne({ _id: new mongoose.Types.ObjectId(class_id), school_id: new mongoose.Types.ObjectId(schoolId) })
-    if (!clsCheck2) { res.status(403).json({ error: "Class not found in your school" }); return }
+    if (!clsCheck2) { res.status(404).json({ error: "Class not found" }); return }
 
     const user = await User.findById(req.userId).select("role").lean()
 
@@ -366,7 +372,22 @@ router.put("/reorder", async (req: AuthRequest, res: Response) => {
 // ── POST /api/modules/:id/items — add file(s) or a link ──────────────────────
 // For files: multipart/form-data with field name "files" (up to 10)
 // For link:  JSON body { type: "link", label, link_url }
-router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, res: Response) => {
+// Students and parents are refused before multer writes anything to the temp folder.
+function staffOnlyBeforeUpload(req: AuthRequest, res: Response, next: NextFunction): void {
+  if (!req.userRole || !["teacher", "admin", "super_admin"].includes(req.userRole)) {
+    res.status(403).json({ error: "Only teachers can add lesson items" }); return
+  }
+  next()
+}
+
+// Removes every temp file multer wrote for this request (already-deleted ones are ignored).
+async function removeTempUploads(req: AuthRequest): Promise<void> {
+  const files = req.files as Express.Multer.File[] | undefined
+  if (!files?.length) return
+  await Promise.all(files.map(f => fsPromises.unlink(f.path).catch(() => {})))
+}
+
+router.post("/:id/items", staffOnlyBeforeUpload, upload.array("files", 10), async (req: AuthRequest, res: Response) => {
   try {
     const result = await canWriteModule(req.userId!, req.params.id)
     if ("error" in result) { res.status(result.status).json({ error: result.error }); return }
@@ -405,6 +426,14 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
       const bucket = getGridFSBucket()
       const addedItems: typeof mod.items = []
       let totalBytesUploaded = 0
+      const pptxQueueAvailable = getPptxQueue() !== null
+      const pendingConversions: PptxJobData[] = []
+      // If a later file is refused, files already copied into storage for this request are removed too
+      const discardStored = async () => {
+        await Promise.all(addedItems.flatMap(i => [i.gridfs_id, i.pdf_gridfs_id])
+          .filter((id): id is mongoose.Types.ObjectId => !!id)
+          .map(id => bucket.delete(id).catch(() => {})))
+      }
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i]
@@ -416,7 +445,7 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
           // cannot be trusted. file-type reads the magic bytes from the file on disk.
           const detectedType = await fileTypeFromFile(file.path)
           if (detectedType && !ALLOWED_MIME_TYPES.has(detectedType.mime)) {
-            await fsPromises.unlink(file.path).catch(() => {})
+            await discardStored()
             res.status(415).json({ error: `File type not allowed: ${detectedType.mime}` })
             return
           }
@@ -447,17 +476,24 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
           // When Redis/BullMQ is available: enqueue async job — upload returns immediately,
           // pdf_gridfs_id is populated by the worker once conversion completes.
           // Fallback (no Redis): convert synchronously on this request thread.
+          // The item id is created up front so the queued job and the saved item share it —
+          // otherwise the worker's update matches nothing and the PDF is never linked.
+          const itemId = new mongoose.Types.ObjectId()
           let pdfGridfsId: mongoose.Types.ObjectId | null = null
+          let conversionStatus: "pending" | "ready" | "failed" | null = null
           if (fileExt === "pptx" || fileExt === "ppt") {
-            const itemId = new mongoose.Types.ObjectId()
-            const jobId = await queuePptxConversion({
-              moduleId: mod._id.toString(),
-              itemId:   itemId.toString(),
-              gridfsId: gridfsId.toString(),
-              fileName: file.originalname,
-            }).catch(() => null)
-
-            if (!jobId) {
+            if (pptxQueueAvailable) {
+              // Queued only after the module is saved (below), so the worker always finds the item
+              conversionStatus = "pending"
+              pendingConversions.push({
+                moduleId: mod._id.toString(),
+                itemId:   itemId.toString(),
+                gridfsId: gridfsId.toString(),
+                fileName: file.originalname,
+                schoolId: mod.school_id.toString(),
+                classId:  mod.class_id.toString(),
+              })
+            } else {
               // No queue — fall back to synchronous conversion
               try {
                 const fileBuffer = await fsPromises.readFile(file.path)
@@ -481,7 +517,9 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
                   pdfStream.on("finish", () => resolve(pdfStream.id as mongoose.Types.ObjectId))
                   pdfStream.end(pdfBuffer)
                 })
+                conversionStatus = "ready"
               } catch (err) {
+                conversionStatus = "failed"
                 logger.error({ err }, `[libreoffice] PDF conversion failed for ${file.originalname}`)
               }
             }
@@ -491,12 +529,13 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
           totalBytesUploaded += file.size
 
           const item = {
-            _id:           new mongoose.Types.ObjectId(),
+            _id:           itemId,
             order:         nextOrder + i,
             type:          "file" as const,
             label:         file.originalname,
             gridfs_id:     gridfsId,
             pdf_gridfs_id: pdfGridfsId,
+            conversion_status: conversionStatus,
             file_name:     file.originalname,
             file_type:     fileExt,
             file_size:     file.size,
@@ -513,6 +552,20 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
       mod.items.push(...addedItems)
       mod.updated_at = new Date()
       await mod.save()
+
+      // Queue slide conversions now that their items exist. A job that cannot be queued
+      // is marked failed so the teacher sees it — it is never retried behind the scenes.
+      for (const job of pendingConversions) {
+        const jobId = await queuePptxConversion(job).catch(() => null)
+        if (!jobId) {
+          await Module.updateOne(
+            { _id: mod._id, "items._id": job.itemId },
+            { $set: { "items.$.conversion_status": "failed" } },
+          )
+          const queued = addedItems.find(i => i._id.toString() === job.itemId)
+          if (queued) queued.conversion_status = "failed"
+        }
+      }
 
       // Atomically increment the school's storage counter.
       // $max(0, ...) guard ensures it can never go below zero due to a race.
@@ -548,6 +601,7 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
       label:     label?.trim() || link_url,
       gridfs_id:     null,
       pdf_gridfs_id: null,
+      conversion_status: null,
       file_name:     null,
       file_type:     null,
       file_size:     null,
@@ -563,6 +617,9 @@ router.post("/:id/items", upload.array("files", 10), async (req: AuthRequest, re
   } catch (err) {
     logger.error({ err: err }, "[modules POST /:id/items]")
     res.status(500).json({ error: "Failed to add item" })
+  } finally {
+    // Every exit — refused, failed or successful — leaves nothing in the temp folder
+    await removeTempUploads(req)
   }
 })
 
@@ -694,6 +751,48 @@ router.post("/:id/items/:itemId/viewed", async (req: AuthRequest, res: Response)
   } catch (err) {
     logger.error({ err: err }, "[modules POST /:id/items/:itemId/viewed]")
     res.status(500).json({ error: "Failed to record progress" })
+  }
+})
+
+// ── DELETE /api/modules/:id/items/:itemId/viewed — student undoes a "Mark Done" ──
+router.delete("/:id/items/:itemId/viewed", async (req: AuthRequest, res: Response) => {
+  try {
+    const user = await User.findById(req.userId).select("role school_id class_id").lean()
+    if (user?.role !== "student") { res.status(403).json({ error: "Students only" }); return }
+
+    // Verify the module belongs to the student's own school AND class
+    const mod = await Module.findById(req.params.id).select("school_id class_id items").lean()
+    if (!mod) { res.status(404).json({ error: "Module not found" }); return }
+    if (mod.school_id.toString() !== user.school_id?.toString()) {
+      res.status(403).json({ error: "Forbidden" }); return
+    }
+    if (mod.class_id.toString() !== user.class_id?.toString()) {
+      res.status(403).json({ error: "Forbidden" }); return
+    }
+
+    const itemExists = mod.items.some(i => i._id.toString() === req.params.itemId)
+    if (!itemExists) { res.status(404).json({ error: "Item not found in this module" }); return }
+
+    // Atomic — a double-undo click just finds nothing the second time, no error
+    const deleted = await ModuleProgress.findOneAndDelete({
+      student_id: req.userId, module_id: req.params.id, item_id: req.params.itemId,
+    })
+
+    // Only decrement today's activity counter — never touch a past day's record,
+    // and never let it go negative (a view from an earlier day being undone today
+    // has nothing to do with today's count)
+    if (deleted) {
+      const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
+      await StudentActivity.updateOne(
+        { student_id: req.userId!, date: today, items_viewed: { $gt: 0 } },
+        { $inc: { items_viewed: -1 } }
+      )
+    }
+
+    res.json({ success: true })
+  } catch (err) {
+    logger.error({ err: err }, "[modules DELETE /:id/items/:itemId/viewed]")
+    res.status(500).json({ error: "Failed to undo progress" })
   }
 })
 

@@ -13,26 +13,26 @@ import { CircleCheck as CheckCircle2, BookOpen, Users, ChartBar as BarChart2, Me
 
 const PAIN_POINTS = [
   {
-    pain: '"We don\'t have a CS teacher"',
-    fix: "Whisper script tells your existing teacher word-by-word what to say. No CS background needed.",
+    pain: '"Attendance, marks, and homework are scattered across registers, spreadsheets, and WhatsApp"',
+    fix: "One dashboard for every class — attendance, marks, homework, quizzes, and certificates, all in one place for Students, Teachers, Admins, and Parents.",
     icon: <MessageSquare className="w-5 h-5" />,
     gradient: "var(--gradient-stat-blue)",
   },
   {
-    pain: '"The CS & AI syllabus is confusing"',
-    fix: "Every lesson is structured and ready to teach. Board compliance PDF auto-generated.",
+    pain: '"We don\'t have a CS teacher for the new AI & coding syllabus"',
+    fix: "Whisper script tells your existing teacher word-by-word what to say — no CS background needed, plus the full CBSE CT&AI curriculum, ready to teach.",
     icon: <BookOpen className="w-5 h-5" />,
     gradient: "var(--gradient-stat-green)",
   },
   {
-    pain: '"Students use phones but don\'t learn computing"',
-    fix: "Hands-on lessons: algorithms, AI ethics, data handling — age-appropriate for Classes 3–8.",
+    pain: '"Parents keep asking why they can\'t see their child\'s progress in real time"',
+    fix: "Parents get a live, read-only view of attendance, marks, and homework — no separate app, no extra charge to families.",
     icon: <Users className="w-5 h-5" />,
     gradient: "var(--gradient-stat-amber)",
   },
   {
-    pain: '"We can\'t afford expensive lab software"',
-    fix: "Works on any existing device. Lessons also download for fully offline use.",
+    pain: '"We can\'t afford expensive lab software or per-family app fees"',
+    fix: "Works on any existing device, laptop or mobile. One school-wide subscription — never billed to parents.",
     icon: <Wifi className="w-5 h-5" />,
     gradient: "var(--gradient-stat-purple)",
   },
@@ -40,29 +40,29 @@ const PAIN_POINTS = [
 
 const STEPS = [
   { num: "01", title: "14-day free trial", desc: "Start today. No credit card. No setup. We import your class list in 10 minutes." },
-  { num: "02", title: "We train your teacher", desc: "One 30-minute onboarding call for your CS teacher. Whisper script handles the rest." },
-  { num: "03", title: "Classes go live", desc: "First lesson runs on day 1. Students, teachers, and admin get instant access." },
-  { num: "04", title: "Track and comply", desc: "Admin dashboard shows board compliance %. Download compliance PDF any time." },
+  { num: "02", title: "We train your staff", desc: "One 30-minute onboarding call for your teachers and admin. We handle the rest." },
+  { num: "03", title: "Classes go live", desc: "Attendance, marks, and homework tracking start day 1. Students, teachers, and admin get instant access." },
+  { num: "04", title: "Track and comply", desc: "Admin dashboard shows attendance, progress, and board compliance %. Download reports any time." },
 ]
 
-const TESTIMONIALS = [
+const WHY_FOUNDING_SCHOOLS = [
   {
-    quote: "Our teacher was terrified of AI lessons. The whisper script gave her confidence. By week three she stopped reading it.",
-    name: "Mrs Anita Kapoor",
-    role: "Principal, DPS Meerut",
-    initials: "AK",
+    quote: "Attendance, marks, homework and certificates for every class in your school — one dashboard for Students, Teachers, Admins and Parents, instead of five separate tools.",
+    name: "One platform, every role",
+    role: "Full student-tracking suite",
+    initials: "✓",
   },
   {
-    quote: "Parents love the Sunday WhatsApp updates. It shows them their child is learning 21st century skills, not just textbooks.",
-    name: "Mr Ramesh Pillai",
-    role: "Vice-Principal, KV No. 3 Hyderabad",
-    initials: "RP",
+    quote: "Certificates are generated with your school's own logo and colours the moment a student qualifies — no manual design work, no waiting.",
+    name: "Your branding, automatically",
+    role: "Certificate generation built in",
+    initials: "✓",
   },
   {
-    quote: "The compliance PDF saved us 6 hours of documentation every quarter. We just download and submit.",
-    name: "Mrs Sunita Bose",
-    role: "CS Coordinator, Springdales Pusa Road",
-    initials: "SB",
+    quote: "The board compliance PDF is one click, built from real attendance and progress data already in the system — nothing to compile by hand.",
+    name: "Compliance, made simple",
+    role: "Auto-generated reports",
+    initials: "✓",
   },
 ]
 
@@ -147,13 +147,14 @@ export function ForSchoolsPage() {
             <span className="text-xs font-medium text-ts-blue">For school administrators</span>
           </div>
           <h1 className="text-3xl md:text-4xl font-medium text-foreground leading-snug mb-4">
-            Your school can teach AI and coding
+            Run your whole school on one platform
             <br className="hidden md:block" />
-            <span className="gradient-text-blue-green"> without a CS teacher</span>
+            <span className="gradient-text-blue-green"> — attendance, marks, and more</span>
           </h1>
           <p className="text-sm text-muted-foreground max-w-xl leading-relaxed mb-6">
-            TeachScript is a complete Class 3–8 Computer Science platform. CBSE, State Board & ICSE aligned. Works offline.
-            Your existing teacher follows a whisper script — no technical background required.
+            TeachScript tracks attendance, marks, homework, quizzes, and certificates for every class in your school —
+            plus a complete CBSE-aligned Computer Science curriculum your existing teacher can deliver with no CS background.
+            Works offline, on any device.
           </p>
           <div className="flex flex-wrap gap-3">
             <Button
@@ -228,12 +229,12 @@ export function ForSchoolsPage() {
           <h2 className="text-2xl font-medium text-foreground text-center mb-10">Everything your school needs</h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
             {[
-              { icon: <BookOpen className="w-5 h-5" />, gradient: "var(--gradient-stat-blue)", title: "210 ready lessons", desc: "Classes 3–8 full Computer Science curriculum. PPT slides, activities, videos, and quizzes included." },
-              { icon: <MessageSquare className="w-5 h-5" />, gradient: "var(--gradient-stat-green)", title: "Whisper script", desc: "Every lesson has a word-by-word teacher script. Update automatically as lesson advances." },
-              { icon: <BarChart2 className="w-5 h-5" />, gradient: "var(--gradient-stat-purple)", title: "Admin dashboard", desc: "Track board compliance %, teacher attendance, student progress, and quiz scores in one place." },
-              { icon: <Award className="w-5 h-5" />, gradient: "var(--gradient-stat-amber)", title: "Student certificates", desc: "Auto-generated certificates when students complete chapters. Downloadable PDF." },
+              { icon: <BarChart2 className="w-5 h-5" />, gradient: "var(--gradient-stat-purple)", title: "Admin dashboard", desc: "Track attendance, marks, teacher activity, and board compliance % for every class, in one place." },
+              { icon: <Award className="w-5 h-5" />, gradient: "var(--gradient-stat-amber)", title: "Student certificates", desc: "Auto-generated certificates with your school's own logo and colours. Downloadable PDF." },
+              { icon: <Clock className="w-5 h-5" />, gradient: "var(--gradient-stat-blue)", title: "Sunday Night Sync", desc: "Automated WhatsApp digest to parents every Sunday with their child's weekly progress across every subject." },
+              { icon: <BookOpen className="w-5 h-5" />, gradient: "var(--gradient-stat-green)", title: "210 ready CS lessons", desc: "Full Computer Science curriculum for Classes 3–8. PPT slides, activities, videos, and quizzes included." },
+              { icon: <MessageSquare className="w-5 h-5" />, gradient: "var(--gradient-stat-green)", title: "Whisper script", desc: "For the CS curriculum: a word-by-word teacher script, so any teacher can deliver it with confidence." },
               { icon: <Shield className="w-5 h-5" />, gradient: "var(--gradient-stat-red)", title: "DPDP compliant", desc: "No behavioral tracking. No ads. No student PII for Class 3–5. Compliant with DPDP Act 2023." },
-              { icon: <Clock className="w-5 h-5" />, gradient: "var(--gradient-stat-blue)", title: "Sunday Night Sync", desc: "Automated WhatsApp digest to parents every Sunday with their child's weekly CS progress." },
             ].map((f, i) => (
               <div key={f.title} className="glass-card rounded-[14px] p-5 relative overflow-hidden hover:scale-[1.02] transition-transform animate-fade-in-up" style={{ animationDelay: `${i * 0.06}s` }}>
                 <div className="absolute top-0 left-0 right-0 h-1 rounded-t-[14px]" style={{ background: f.gradient }} />
@@ -257,7 +258,7 @@ export function ForSchoolsPage() {
             <span className="text-xs font-medium text-ts-green">ROI calculator</span>
           </div>
           <h2 className="text-2xl font-medium text-foreground text-center mb-2">See how much your school saves</h2>
-          <p className="text-sm text-muted-foreground text-center mb-10">Compare hiring a CS teacher vs TeachScript subscription</p>
+          <p className="text-sm text-muted-foreground text-center mb-10">Compare hiring a dedicated CS teacher vs the TeachScript subscription that covers your whole school</p>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             {/* Sliders */}
@@ -316,8 +317,8 @@ export function ForSchoolsPage() {
             <CheckCircle2 className="w-4 h-4 text-ts-green" />
             <span className="text-xs font-medium text-ts-green">CBSE · State Board · ICSE</span>
           </div>
-          <h2 className="text-2xl font-medium text-foreground text-center mb-2">Complete compliance, built-in</h2>
-          <p className="text-sm text-muted-foreground text-center mb-10">Every TeachScript lesson is structured to meet Computer Science curriculum requirements across all major Indian school boards.</p>
+          <h2 className="text-2xl font-medium text-foreground text-center mb-2">The CS curriculum, fully board-compliant</h2>
+          <p className="text-sm text-muted-foreground text-center mb-10">If your school needs the mandatory CBSE CT&AI curriculum, every TeachScript lesson is structured to meet its requirements across all major Indian school boards.</p>
 
           <div className="glass-card rounded-[16px] p-6 relative overflow-hidden">
             <div className="absolute top-0 left-0 right-0 h-1 rounded-t-[16px]" style={{ background: "var(--gradient-stat-green)" }} />
@@ -351,9 +352,9 @@ export function ForSchoolsPage() {
       <section className="gradient-hero py-16 px-4 relative overflow-hidden">
         <div className="absolute bottom-0 right-0 w-64 h-64 rounded-full opacity-10 blur-3xl" style={{ background: "var(--ts-amber)" }} />
         <div className="max-w-4xl mx-auto relative z-10">
-          <h2 className="text-2xl font-medium text-foreground text-center mb-10">What schools say</h2>
+          <h2 className="text-2xl font-medium text-foreground text-center mb-10">Why founding schools choose us</h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-            {TESTIMONIALS.map((t, i) => (
+            {WHY_FOUNDING_SCHOOLS.map((t, i) => (
               <div key={t.name} className="glass-card rounded-[14px] p-5 relative overflow-hidden animate-fade-in-up" style={{ animationDelay: `${i * 0.1}s` }}>
                 <div className="absolute top-0 left-0 right-0 h-0.5" style={{ background: i === 0 ? "var(--gradient-stat-blue)" : i === 1 ? "var(--gradient-stat-green)" : "var(--gradient-stat-amber)" }} />
                 <p className="text-sm text-foreground leading-relaxed mb-4">"{t.quote}"</p>

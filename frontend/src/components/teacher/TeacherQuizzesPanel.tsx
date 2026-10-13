@@ -354,7 +354,7 @@ export function TeacherQuizzesPanel({ ttClasses, setView }: Props) {
               <button key={tab} onClick={() => setQuizCreatorTab(tab)}
                 className="flex-1 text-[11px] font-semibold py-1.5 rounded-[8px] transition-all cursor-pointer"
                 style={quizCreatorTab === tab
-                  ? { background: "white", color: "#534AB7", boxShadow: "0 1px 3px rgba(0,0,0,0.12)" }
+                  ? { background: "var(--card)", color: "#534AB7", boxShadow: "0 1px 3px rgba(0,0,0,0.12)" }
                   : { color: "var(--muted-foreground)" }}>
                 {tab === "manual" ? "✏️ Manual" : tab === "paste" ? "📋 Paste" : "🤖 AI Generate"}
               </button>

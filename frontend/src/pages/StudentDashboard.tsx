@@ -2,13 +2,16 @@
 // pages/StudentDashboard.tsx — All student views in one component.
 // Views: dashboard | lessons | timetable | quizzes | quiz-attempt | quiz-result
 //         | certificates | attendance | challenges | settings | teachers
-// Each view is lazy-loaded on first open. Navigation is via the view state —
-// no separate React Router routes are used for sub-views.
+// Each view is lazy-loaded on first open. The section and the selected subject live in the URL
+// (/student/dashboard/<section>[/<subject>] — see lib/studentRoutes.ts) so Refresh, Back and
+// bookmarks work; the quiz player and quiz results are in-progress screens kept in state.
 // ─────────────────────────────────────────────────────────────────────────────
 import React, { useState, useEffect, useRef, type ReactNode } from "react"
-import * as XLSX from "xlsx"
+import { useLocation, useNavigate } from "react-router-dom"
+import { withXlsx } from "@/lib/excel"
 import { createPortal } from "react-dom"
 import { DashboardLayout } from "@/components/DashboardLayout"
+import { DashboardNotFound } from "@/components/DashboardNotFound"
 import { ProgressBar } from "@/components/ProgressBar"
 import {
   LayoutDashboard, BookOpen, ClipboardList, Award, Calendar, Settings,
@@ -21,26 +24,34 @@ import { Input } from "@/components/ui/input"
 import { useAuth } from "@/contexts/AuthContext"
 import { getMyClass, updateProfile, getStudentTimetable } from "@/lib/userApi"
 import {
-  getStudentDashboard, pingActivity, getStudentQuests, getClassmates,
+  getStudentDashboard, getStudentQuests, getClassmates,
   getMyQuizzes, submitQuizAttempt, getMyQuizAttempts,
   getActiveChallenges, submitChallenge,
-  getMyCertificates, claimCertificate, getEligibleCertificates, downloadStudentCertPDF, viewStudentCertPDF_student,
+  getMyCertificates, isRevoked, downloadStudentCertPDF, viewStudentCertPDF_student,
   getMyTeachers, getMyAttendance, getAttendanceRange,
   type DashboardSummary, type Quiz, type QuizAttemptResult,
-  type QuizHistory, type StudentCertificate, type EligibleSubject, type StudentQuest, type MyTeacher,
+  type QuizHistory, type StudentCertificate, type StudentQuest, type MyTeacher,
   type AttendanceSummary, type AttendancePeriodSummary,
 } from "@/lib/studentApi"
 import { SubjectIcon, getSubjectMeta } from "./TeacherDashboard"
 import { TimetableDisplayView } from "@/components/TimetableDisplayView"
 import { DatePicker } from "@/components/ui/date-picker"
 import {
-  getModules, markItemViewed, getViewerUrl, driveEmbedUrl, fetchAsBlobUrl, formatFileSize, fileIcon, linkIcon, needsDownloadFallback,
+  getModules, getViewerUrl, driveEmbedUrl, fetchAsBlobUrl, slideConversionState, isStreamedVideo,
   type LessonModule, type ModuleItem,
 } from "@/lib/moduleApi"
 import { requestDataDeletion } from "@/lib/dpdpApi"
 import { SkeletonList } from "@/components/SkeletonCard"
 import { StudentHomeworkPanel } from "@/components/student/StudentHomeworkPanel"
+import { StudentLessonsItemsPanel } from "@/components/student/StudentLessonsItemsPanel"
 import { StudentMarksPanel } from "@/components/student/StudentMarksPanel"
+import { findSubjectBySlug, slugForSubject } from "@/lib/dashboardRoutes"
+import { parseStudentPath, studentPath } from "@/lib/studentRoutes"
+import {
+  attendanceBasisLabel, formatCountedDate, istTodayYmd, isAttendanceCacheUsable,
+} from "@/lib/attendanceBasis"
+import { UserPhoto } from "@/components/UserPhoto"
+import { LessonVideo } from "@/components/LessonVideo"
 
 // ── Static data ───────────────────────────────────────────────────────────────
 
@@ -75,28 +86,38 @@ const NAV_ITEMS = [
 
 type View = "dashboard" | "lessons" | "quiz" | "quiz-results" | "quizzes" | "certificates" | "attendance" | "settings" | "live-coding" | "timetable" | "teachers" | "marks" | "homework"
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// MED-08: HTML escape helper to prevent XSS in certificate generation
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+// Browser-tab title per section ("Homework – TeachScript").
+const SECTION_TITLES: Record<View, string> = {
+  "dashboard": "Dashboard", "lessons": "Lessons", "quiz": "Quiz", "quiz-results": "Quiz results",
+  "quizzes": "Quizzes", "certificates": "Certificates", "attendance": "My attendance",
+  "settings": "Settings", "live-coding": "Live Code", "timetable": "Timetable",
+  "teachers": "Teachers", "marks": "My Marks", "homework": "Homework",
 }
 
-function downloadCertificate(studentName: string, chapter: string, className: string) {
-  const date = new Date().toLocaleDateString("en-IN", { month: "long", year: "numeric" })
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>Certificate</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:40px}.cert{width:780px;background:#fff;border-radius:20px;padding:64px;text-align:center;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.12)}.top-bar{height:6px;background:linear-gradient(135deg,#534AB7,#378ADD);border-radius:20px 20px 0 0;position:absolute;top:0;left:0;right:0}.inner{position:absolute;inset:12px;border-radius:14px;border:1.5px solid rgba(83,74,183,.2);pointer-events:none}.logo{font-size:18px;font-weight:900;color:#534AB7;margin-bottom:4px}.sub{font-size:11px;color:#aaa;letter-spacing:3px;text-transform:uppercase;margin-bottom:36px}.medal{font-size:52px;margin-bottom:20px}.title{font-size:32px;font-weight:700;color:#1a1a18;margin-bottom:8px}.awarded{font-size:11px;color:#aaa;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}.name{font-size:44px;font-weight:300;color:#534AB7;margin-bottom:28px;border-bottom:1px solid rgba(83,74,183,.15);padding-bottom:24px}.body{font-size:15px;color:#555;line-height:1.9;margin-bottom:40px}.footer{display:flex;justify-content:space-between;align-items:flex-end;border-top:1px solid #f0f0f0;padding-top:24px}.seal{width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#534AB7,#378ADD);display:flex;align-items:center;justify-content:center;font-size:28px}.fl{font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:4px}.fv{font-size:13px;color:#333;font-weight:600}@media print{body{background:#fff;padding:0}.cert{box-shadow:none}}</style></head><body>
-<div class="cert"><div class="top-bar"></div><div class="inner"></div>
-<div class="logo">🎓 TeachScript</div><div class="sub">India's CS Teaching Platform</div>
-<div class="medal">🏆</div><div class="title">Certificate of Completion</div>
-<div class="awarded">This certifies that</div><div class="name">${escHtml(studentName)}</div>
-<div class="body">has successfully completed<br/><strong>${escHtml(chapter)}</strong><br/>as part of the Computer Science Curriculum<br/>in <strong>${escHtml(className)}</strong></div>
-<div class="footer"><div><div class="fl">Issued in</div><div class="fv">${date}</div></div><div class="seal">⭐</div><div style="text-align:right"><div class="fl">Issued by</div><div class="fv">TeachScript India</div></div></div></div>
-<script>window.onload=()=>window.print();</script></body></html>`
-  const blob = new Blob([html], { type: "text/html" })
-  const url = URL.createObjectURL(blob)
-  window.open(url, "_blank")
-  setTimeout(() => URL.revokeObjectURL(url), 10000)
+// English wording of the attendance screens' empty states, kept in one place so Hindi can be added later.
+// The "counted from" caption itself comes from lib/attendanceBasis.ts.
+const ATTENDANCE_TEXT = {
+  notRecorded:       "Not recorded",
+  notCountedYet:     "Not counted yet",
+  noSheetsSince:     (date: string) => `No attendance recorded since ${date}`,
+  beforeCountedFrom: "Before the counted-from date",
+  noRecordsForDate:  "No attendance recorded for this date.",
+  noRecordsInPeriod: "No attendance recorded in this period.",
+} as const
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// The caption under an attendance figure, built only from the server's `counted_from` and
+// `counted_class_label` (the browser never works the date out). Empty while nothing has loaded.
+function attendanceBasisLine(
+  source: { counted_from?: string | null; counted_class_label?: string | null } | null | undefined
+): string {
+  if (!source) return ""
+  return attendanceBasisLabel({
+    countedFrom: source.counted_from ?? null,
+    className:   source.counted_class_label ?? null,
+    todayYmd:    istTodayYmd(),
+  })
 }
 
 function downloadAttendanceXLSX(userName: string, month: string, records: Array<{ date: string; period: number; subject: string; status: string }>) {
@@ -119,28 +140,32 @@ function downloadAttendanceXLSX(userName: string, month: string, records: Array<
     ...dataRows,
   ]
 
-  const ws = XLSX.utils.aoa_to_sheet(aoa)
-  ws["!cols"] = [{ wch: 4 }, { wch: 13 }, { wch: 12 }, { wch: 10 }, { wch: 22 }, { wch: 10 }]
-  ws["!freeze"] = { xSplit: 0, ySplit: 4 }
+  // The Excel library is loaded only now, when the student asks for the sheet
+  withXlsx("my-attendance", XLSX => {
+    const ws = XLSX.utils.aoa_to_sheet(aoa)
+    ws["!cols"] = [{ wch: 4 }, { wch: 13 }, { wch: 12 }, { wch: 10 }, { wch: 22 }, { wch: 10 }]
+    ws["!freeze"] = { xSplit: 0, ySplit: 4 }
 
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, "Attendance")
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, "Attendance")
 
-  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" })
-  const blob = new Blob([buf], { type: "application/octet-stream" })
-  const a = document.createElement("a")
-  a.href = URL.createObjectURL(blob)
-  a.download = `${userName.replace(/\s+/g, "_")}_Attendance_${month.replace(/\s+/g, "_")}.xlsx`
-  document.body.appendChild(a); a.click(); document.body.removeChild(a)
-  URL.revokeObjectURL(a.href)
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" })
+    const blob = new Blob([buf], { type: "application/octet-stream" })
+    const a = document.createElement("a")
+    a.href = URL.createObjectURL(blob)
+    a.download = `${userName.replace(/\s+/g, "_")}_Attendance_${month.replace(/\s+/g, "_")}.xlsx`
+    document.body.appendChild(a); a.click(); document.body.removeChild(a)
+    URL.revokeObjectURL(a.href)
+  })
 }
 
-// ── 3D Student Illustration — chibi school boy PNG ───────────────────────────
-function StudentIllustration() {
+// ── 3D Student Illustration — chibi school boy / girl PNG ────────────────────
+function StudentIllustration({ gender }: { gender?: "male" | "female" | null }) {
+  const src = gender === "female" ? "/student-girl-3d.webp" : "/student-boy.webp"
   return (
     <img
-      src="/student-boy.png"
-      alt="Student"
+      src={src}
+      alt=""
       className="w-28 h-28 sm:w-44 sm:h-44 flex-shrink-0 object-contain"
       style={{ animation: "float 4s ease-in-out infinite", filter: "drop-shadow(0 12px 28px rgba(83,74,183,0.22))" }}
     />
@@ -697,8 +722,17 @@ function isGoogleUrl(url: string): boolean {
 
 // ── Main component ────────────────────────────────────────────────────────────
 export function StudentDashboard() {
-  const { user } = useAuth()
-  const [view, setView] = useState<View>("dashboard")
+  const { user, signOutDueToSessionExpired } = useAuth()
+  const [dashError, setDashError] = useState("")
+  const location = useLocation()
+  const navigate = useNavigate()
+  const route = parseStudentPath(location.pathname)
+  // The quiz player and quiz results are in-progress screens, deliberately kept out of the URL.
+  const [inProgressView, setInProgressView] = useState<"quiz" | "quiz-results" | null>(null)
+  const urlView: View = route.kind === "section" ? route.section : "dashboard"
+  const view: View = inProgressView ?? urlView
+  // Leaving the page with Back/Forward (or any URL change) also leaves an in-progress screen.
+  useEffect(() => { setInProgressView(null) }, [location.pathname])
   const [myClass, setMyClass] = useState<{ id: string; grade: number; section: string; label: string; teacher_name?: string | null; subject_teachers?: Array<{ teacher_id: string | null; teacher_name: string | null; subject: string }> } | null>(null)
 
   useEffect(() => {
@@ -713,6 +747,8 @@ export function StudentDashboard() {
   const [myAttendance,  setMyAttendance]  = useState<StudentAttRec[]>([])
   const [attLoaded,     setAttLoaded]     = useState(false)
   const [attSummary,    setAttSummary]    = useState<AttendanceSummary | null>(null)
+  // Where the server counted the figures from (null until the attendance response has arrived)
+  const [attBasis,      setAttBasis]      = useState<{ counted_from: string | null; counted_class_label: string | null } | null>(null)
   const [rangeFrom,     setRangeFrom]     = useState("")
   const [rangeTo,       setRangeTo]       = useState("")
   const [rangeResult,   setRangeResult]   = useState<AttendancePeriodSummary | null>(null)
@@ -731,6 +767,7 @@ export function StudentDashboard() {
       if ("error" in res) return
       setAttSummary(res.summary)
       setMyAttendance(res.records)
+      setAttBasis({ counted_from: res.counted_from ?? null, counted_class_label: res.counted_class_label ?? null })
     })
   }, [view, attLoaded])
 
@@ -754,6 +791,7 @@ export function StudentDashboard() {
   const [ttUpdatedAt, setTtUpdatedAt] = useState<string | null>(null)
   const [ttLoading, setTtLoading] = useState(false)
   const [ttLoaded, setTtLoaded] = useState(false)
+  const [ttFailed, setTtFailed] = useState(false)
 
   useEffect(() => {
     if ((view !== "timetable" && view !== "lessons") || ttLoaded || ttLoading) return
@@ -761,7 +799,8 @@ export function StudentDashboard() {
     getStudentTimetable().then(res => {
       setTtLoading(false)
       setTtLoaded(true)
-      if ("error" in res) return
+      if ("error" in res) { setTtFailed(true); return }
+      setTtFailed(false)
       setTtSlots(res.timetable)
       setTtSubjects(res.subjects)
       setTtUpdatedBy(res.timetable_updated_by_name)
@@ -783,22 +822,47 @@ export function StudentDashboard() {
   const [quizHistory,    setQuizHistory]    = useState<QuizHistory[]>([])
   const [submittingQuiz, setSubmittingQuiz] = useState(false)
   const [realCerts,      setRealCerts]      = useState<StudentCertificate[]>([])
-  const [eligibleCerts,  setEligibleCerts]  = useState<EligibleSubject[]>([])
   const [certsLoading,   setCertsLoading]   = useState(false)
   const [certsLoaded,    setCertsLoaded]    = useState(false)
-  const [claimingId,     setClaimingId]     = useState<string | null>(null)
+  const [certsError,     setCertsError]     = useState(false)
 
-  // Refresh dashboard data — called on mount and after clock in/out
+  // The dashboard summary is only fetched for the screens that show it — the Dashboard
+  // itself and the Lessons subject grid (per-subject progress) — and at most once every
+  // 2 minutes. Other sections never trigger it. Mark Done updates the numbers locally.
+  const DASH_FRESH_MS = 2 * 60_000
+  const dashFetchedAtRef = useRef(0)
+  const extrasFetchedAtRef = useRef(0)
+  const needsDashSummary = view === "dashboard" || view === "lessons"
+
+  // Refresh the dashboard summary — called when a screen that shows it opens, on Retry, and after clock in/out
   function refreshDashboard() {
     if (!user?.id) return
     const cacheKey = `ts_dash_v2_${user.id}`
+    dashFetchedAtRef.current = Date.now()
     getStudentDashboard().then(res => {
       setDashLoading(false)
       if (!("error" in res)) {
+        setDashError("")
         setDashSummary(res)
         try { localStorage.setItem(cacheKey, JSON.stringify({ data: res, ts: Date.now() })) } catch { /* ignore */ }
+        return
       }
+      dashFetchedAtRef.current = 0 // a failed load must not count as fresh
+      // A 401 here means the session died server-side (idle revocation on another
+      // tab, token_version bump, etc.) without this tab's own idle timer firing —
+      // sign out properly with an explanation rather than leaving stale/empty data
+      // on screen looking like the student's progress vanished.
+      const status = (res as { status?: number }).status
+      if (status === 401) { signOutDueToSessionExpired(); return }
+      setDashError("We couldn't load your dashboard. Please check your connection and try again.")
     })
+  }
+
+  // Quests and the classmates leaderboard are only shown on the Dashboard screen
+  useEffect(() => {
+    if (!user?.id || view !== "dashboard") return
+    if (extrasFetchedAtRef.current && Date.now() - extrasFetchedAtRef.current < DASH_FRESH_MS) return
+    extrasFetchedAtRef.current = Date.now()
     getStudentQuests().then(res => {
       setQuestsLoading(false)
       if (!("error" in res)) setRealQuests(res.quests)
@@ -806,11 +870,12 @@ export function StudentDashboard() {
     getClassmates().then(res => {
       if (!("error" in res)) setRealClassmates(res.classmates)
     })
-  }
+  }, [user?.id, view])
 
-  // Fetch dashboard summary + quests on mount
+  // Fetch the dashboard summary when a screen that shows it is opened
   useEffect(() => {
-    if (!user?.id) return
+    if (!user?.id || !needsDashSummary) return
+    if (dashFetchedAtRef.current && Date.now() - dashFetchedAtRef.current < DASH_FRESH_MS) return
 
     // Step 1: Load from localStorage cache immediately (feels instant)
     const cacheKey    = `ts_dash_v2_${user.id}` // v2 = includes day + school_day_minutes
@@ -819,9 +884,17 @@ export function StudentDashboard() {
       const cached = localStorage.getItem(cacheKey)
       if (cached) {
         const { data, ts } = JSON.parse(cached) as { data: DashboardSummary; ts: number }
-        // Validate cache has the new format (weekly_activity items must have `day` field)
+        // Validate cache has the new format (weekly_activity items must have `day`
+        // field, and days_recorded must be present). A cache saved before a field
+        // was added would otherwise render as a false "0" until the background
+        // refresh overwrites it a moment later — skip it instead and show the
+        // loading state until fresh data arrives. A copy saved before attendance was
+        // counted from the class's year start carries the old, wrong figure
+        // (isAttendanceCacheUsable), so it is skipped too.
         const isValid = Array.isArray(data.weekly_activity) &&
-          (data.weekly_activity.length === 0 || "day" in data.weekly_activity[0])
+          (data.weekly_activity.length === 0 || "day" in data.weekly_activity[0]) &&
+          "days_recorded" in data &&
+          isAttendanceCacheUsable(data)
         if (isValid && Date.now() - ts < cacheTTL) {
           setDashSummary(data)
           setDashLoading(false) // show cached data instantly, no spinner
@@ -831,7 +904,7 @@ export function StudentDashboard() {
 
     // Step 2: Fetch fresh data in background (silently updates)
     refreshDashboard()
-  }, [user?.id])
+  }, [user?.id, needsDashSummary])
 
   // Fetch quizzes + history when navigating to quizzes view
   useEffect(() => {
@@ -845,15 +918,15 @@ export function StudentDashboard() {
     })
   }, [view, quizzesLoaded])
 
-  // Fetch certificates when navigating to certificates view
+  // Fetch certificates when navigating to certificates view (once per visit to the page)
   useEffect(() => {
     if (view !== "certificates" || certsLoaded) return
     setCertsLoading(true)
-    Promise.all([getMyCertificates(), getEligibleCertificates()]).then(([cRes, eRes]) => {
+    getMyCertificates().then(cRes => {
       setCertsLoading(false)
       setCertsLoaded(true)
-      if (!("error" in cRes)) setRealCerts(cRes.certificates)
-      if (!("error" in eRes)) setEligibleCerts(eRes.eligible)
+      if ("error" in cRes) { setCertsError(true); return }
+      setRealCerts(cRes.certificates)
     })
   }, [view, certsLoaded])
 
@@ -870,9 +943,25 @@ export function StudentDashboard() {
   const [deletionLoading,   setDeletionLoading]   = useState(false)
   const [deletionMsg,       setDeletionMsg]       = useState("")
   const [deletionErr,       setDeletionErr]       = useState("")
-  const [selectedWeekDate,  setSelectedWeekDate]  = useState<number | null>(null)
+  const [selectedWeekDate,  setSelectedWeekDate]  = useState<Date | null>(null)
+  const [expandedEvent,     setExpandedEvent]     = useState<{ title: string; message: string; type: string; color: string; icon: string; scheduled_at?: string } | null>(null)
+  const [weekAnchor,        setWeekAnchor]        = useState(() => new Date())
+  const [showEventCalendar, setShowEventCalendar] = useState(false)
+  const [eventCalMonth,     setEventCalMonth]     = useState(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1) })
 
-  const [lessonSubject, setLessonSubject] = useState<string | null>(null)
+  // The selected subject comes from the URL (/lessons/<subject-slug>). Subject names are free text from
+  // the timetable (plus any subject that already has lessons), so the slug is matched against that list.
+  // While the list is still loading the slug is "pending" (shown as loading). It only becomes "not found"
+  // once loading finished successfully; if the timetable request failed we cannot tell, so we offer a retry.
+  const lessonSubjectNames = Array.from(new Set([...ttSubjects, ...(dashSummary?.module_progress ?? []).map(p => p.subject)]))
+  const lessonsSlug = route.kind === "section" && route.section === "lessons" ? route.subjectSlug : null
+  const lessonSubject = lessonsSlug ? findSubjectBySlug(lessonsSlug, lessonSubjectNames) : null
+  const subjectsSettled = ttLoaded && !ttLoading && !dashLoading
+  const subjectUnresolved = lessonsSlug !== null && lessonSubject === null
+  const subjectPending = subjectUnresolved && !subjectsSettled
+  const subjectLoadFailed = subjectUnresolved && subjectsSettled && ttFailed
+  const subjectNotFound = subjectUnresolved && subjectsSettled && !ttFailed
+  const retrySubjects = () => { setTtFailed(false); setTtLoaded(false) }
 
   // ── module system (student view) ─────────────────────────────────────────────
   const [sModules, setSModules] = useState<LessonModule[]>([])
@@ -882,42 +971,97 @@ export function StudentDashboard() {
   const [sViewerItem, setSViewerItem] = useState<ModuleItem | null>(null)
   const [sViewerBlobUrl, setSViewerBlobUrl] = useState<string | null>(null)
   const [sViewerBlobLoading, setSViewerBlobLoading] = useState(false)
+  // Bumped by the viewer's "Try again" button to load the same file again
+  const [sViewerRetry, setSViewerRetry] = useState(0)
+  // True only after the file really failed to load (drives the "Try again" message)
+  const [sViewerFailed, setSViewerFailed] = useState(false)
+  const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null)
+  const [itemSearchQuery, setItemSearchQuery] = useState("")
+  const [itemStatusFilter, setItemStatusFilter] = useState<"all" | "viewed" | "remaining">("all")
+  const [markingDoneId, setMarkingDoneId] = useState<string | null>(null)
 
   // Load modules when student drills into a subject
   useEffect(() => {
     if (!lessonSubject || !myClass?.id) return
     const key = `${myClass.id}::${lessonSubject}`
     if (key === sModulesKey) return
+    // A slow answer for a subject the student has already left must not overwrite the current one
+    // (easy to trigger now that Back/Forward move between subjects).
+    let cancelled = false
     setSModulesLoading(true)
     setSModules([])
+    setSelectedModuleId(null)
+    setItemSearchQuery("")
+    setItemStatusFilter("all")
     getModules(myClass.id, lessonSubject).then(res => {
+      if (cancelled) return
       setSModulesLoading(false)
       if ("error" in res) return
       setSModules(res.modules)
       setSViewedIds(res.viewedItemIds)
       setSModulesKey(key)
     })
+    return () => { cancelled = true }
   }, [lessonSubject, myClass?.id])
 
-  // All file items are loaded as blob URLs — auth token never appears in a URL
+  // "Check again" on a lesson that is still being prepared: re-read this subject's lessons once
+  // (no polling) and show the PDF if it is ready now. Module selection and filters are kept.
+  const [slideChecking, setSlideChecking] = useState(false)
+  async function recheckSlideConversion(item: ModuleItem) {
+    if (!lessonSubject || !myClass?.id) return
+    setSlideChecking(true)
+    const res = await getModules(myClass.id, lessonSubject)
+    setSlideChecking(false)
+    if ("error" in res) return
+    setSModules(res.modules)
+    setSViewedIds(res.viewedItemIds)
+    const fresh = res.modules.flatMap(m => m.items).find(i => i._id === item._id)
+    if (fresh) setSViewerItem(fresh)
+  }
+
+  // Leaving a subject (or opening a different link) clears the per-subject lesson state.
+  useEffect(() => {
+    if (lessonSubject) return
+    setSModules([]); setSModulesKey(""); setSelectedModuleId(null)
+    setSModulesLoading(false)
+    setItemSearchQuery(""); setItemStatusFilter("all")
+  }, [lessonSubject])
+
+  // Auto-select the first module once modules load (matches design: a module
+  // is always selected so the right panel is never empty on first entry)
+  useEffect(() => {
+    if (sModules.length === 0) { setSelectedModuleId(null); return }
+    if (!selectedModuleId || !sModules.some(m => m._id === selectedModuleId)) {
+      setSelectedModuleId(sModules[0]._id)
+    }
+  }, [sModules, selectedModuleId])
+
+  // Files load as blob URLs (the login token never appears in a URL); videos get a short
+  // reusable stream link so they play in parts instead of downloading whole first
   useEffect(() => {
     if (!sViewerItem) {
       if (sViewerBlobUrl) { URL.revokeObjectURL(sViewerBlobUrl); setSViewerBlobUrl(null) }
       return
     }
     if (sViewerItem.type !== "file") { setSViewerBlobUrl(null); return }
+    // Lesson videos are played in parts by <LessonVideo>, which gets its own stream link
+    if (isStreamedVideo(sViewerItem)) { setSViewerBlobUrl(null); setSViewerBlobLoading(false); return }
+    // A slide deck that is still being prepared has nothing to show — don't download it
+    const slideState = slideConversionState(sViewerItem)
+    if (slideState && slideState !== "ready") { setSViewerBlobUrl(null); setSViewerBlobLoading(false); return }
 
     let cancelled = false
     let created: string | null = null
     setSViewerBlobLoading(true)
+    setSViewerFailed(false)
     setSViewerBlobUrl(null)
     fetchAsBlobUrl(getViewerUrl(sViewerItem)).then(url => {
       if (cancelled) { URL.revokeObjectURL(url); return }
       created = url
       setSViewerBlobUrl(url)
-    }).catch(() => {}).finally(() => { if (!cancelled) setSViewerBlobLoading(false) })
+    }).catch(() => { if (!cancelled) setSViewerFailed(true) }).finally(() => { if (!cancelled) setSViewerBlobLoading(false) })
     return () => { cancelled = true; if (created) URL.revokeObjectURL(created) }
-  }, [sViewerItem])
+  }, [sViewerItem, sViewerRetry])
 
 
   const daysInMonth = new Date(attendanceMonth.getFullYear(), attendanceMonth.getMonth() + 1, 0).getDate()
@@ -944,28 +1088,65 @@ export function StudentDashboard() {
     return `${d}-${m}-${y}`
   }
 
-  // Client-side date ranges shown beside each chip label — computed once per render, IST-aware
-  const chipRanges = (() => {
+  // Date range shown beside each chip label, and the text shown when a chip has no sheets.
+  // Computed once per render, IST-aware. The server counts nothing before `counted_from`, so each
+  // window starts at the later of its own start and that date (the browser only compares the two
+  // dates; it never works `counted_from` out). `This Year` shows "All recorded sheets" when the
+  // server counted every sheet (counted_from null), and nothing until the server has answered.
+  const chipInfo = (() => {
     const todayISO  = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
     const todayDisp = fmtDate(todayISO)
 
     const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }))
     const dow    = nowIST.getDay()
     nowIST.setDate(nowIST.getDate() - (dow === 0 ? 6 : dow - 1))
-    const weekStartDisp  = fmtDate(nowIST.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }))
-    const monthStartDisp = fmtDate(`${todayISO.slice(0, 7)}-01`)
+    const weekStartISO  = nowIST.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
+    const monthStartISO = `${todayISO.slice(0, 7)}-01`
 
     const nowIST2      = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }))
     const yearNum      = nowIST2.getMonth() >= 5 ? nowIST2.getFullYear() : nowIST2.getFullYear() - 1
-    const yearStartDisp = fmtDate(`${yearNum}-06-01`)
+    const yearStartISO = `${yearNum}-06-01`
 
+    const countedFrom   = attBasis?.counted_from ?? null
+    const notCountedYet = countedFrom !== null && countedFrom > todayISO
+    const laterOf       = (windowStart: string) => (countedFrom !== null && countedFrom > windowStart ? countedFrom : windowStart)
+
+    const windowInfo = (windowStart: string) => {
+      const start = laterOf(windowStart)
+      return {
+        range: notCountedYet ? "" : `${fmtDate(start)} → ${todayDisp}`,
+        empty: notCountedYet
+          ? ATTENDANCE_TEXT.notCountedYet
+          : countedFrom === null ? ATTENDANCE_TEXT.notRecorded : ATTENDANCE_TEXT.noSheetsSince(formatCountedDate(start)),
+      }
+    }
+
+    const yearInfo = windowInfo(yearStartISO)
     return {
-      today:      todayDisp,
-      this_week:  `${weekStartDisp} → ${todayDisp}`,
-      this_month: `${monthStartDisp} → ${todayDisp}`,
-      this_year:  `${yearStartDisp} → ${todayDisp}`,
+      today:      { range: todayDisp, empty: notCountedYet ? ATTENDANCE_TEXT.notCountedYet : ATTENDANCE_TEXT.notRecorded },
+      this_week:  windowInfo(weekStartISO),
+      this_month: windowInfo(monthStartISO),
+      this_year:  {
+        range: attBasis === null ? "" : countedFrom === null ? attendanceBasisLine(attBasis) : yearInfo.range,
+        empty: yearInfo.empty,
+      },
     } as const
   })()
+
+  // Captions: under the Attendance tile of the dashboard and at the top of My Attendance
+  const dashBasisText = dashLoading ? "" : attendanceBasisLine(dashSummary)
+  const attBasisText  = attendanceBasisLine(attBasis)
+
+  // Empty-state wording for the calendar day and the custom range (true for dates before the counted-from date)
+  const countedFromYmd    = attBasis?.counted_from ?? null
+  const selectedDateEmpty = !attLoaded
+    ? "Loading…"
+    : countedFromYmd !== null && selectedAttDate < countedFromYmd
+      ? ATTENDANCE_TEXT.beforeCountedFrom
+      : ATTENDANCE_TEXT.noRecordsForDate
+  const rangeEmpty = countedFromYmd !== null && rangeTo !== "" && rangeTo < countedFromYmd
+    ? ATTENDANCE_TEXT.beforeCountedFrom
+    : ATTENDANCE_TEXT.noRecordsInPeriod
 
   const currentAttendanceDate = (day: number) => dayStatusMap[dateString(day)] ?? null
 
@@ -1000,14 +1181,16 @@ export function StudentDashboard() {
     : 0
   const todayDay        = new Date().toLocaleDateString("en-US", { weekday: "short" })
 
-  // Current week dates
+  // Week dates — centered on weekAnchor (defaults to today, navigable via arrows/calendar)
   const today = new Date()
   const weekDays = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
-  const startOfWeek = new Date(today); startOfWeek.setDate(today.getDate() - today.getDay())
+  const startOfWeek = new Date(weekAnchor); startOfWeek.setDate(weekAnchor.getDate() - weekAnchor.getDay())
   const weekDates = weekDays.map((d, i) => {
     const dt = new Date(startOfWeek); dt.setDate(startOfWeek.getDate() + i)
-    return { day: d, date: dt.getDate(), isToday: dt.toDateString() === today.toDateString() }
+    return { day: d, date: dt.getDate(), fullDate: dt, isToday: dt.toDateString() === today.toDateString() }
   })
+  const isCurrentRealWeek = weekDates.some(w => w.isToday)
+  const weekRangeLabel = `${startOfWeek.toLocaleDateString("en-IN", { day: "numeric", month: "short" })} – ${weekDates[6].fullDate.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}`
 
   const VIEW_MAP: Record<string, View> = {
     "Dashboard": "dashboard", "Lessons": "lessons", "Timetable": "timetable",
@@ -1015,13 +1198,37 @@ export function StudentDashboard() {
     "Live Code": "live-coding", "Teachers": "teachers", "Settings": "settings",
     "My Marks": "marks",
   }
+  // Sections change the URL; the quiz player and quiz results are in-progress screens kept in state.
+  const pathForView = (v: Exclude<View, "quiz" | "quiz-results">) => studentPath(v === "dashboard" ? "overview" : v)
+  const nav = (v: View) => {
+    if (v === "quiz" || v === "quiz-results") { setInProgressView(v); return }
+    setInProgressView(null)
+    const target = pathForView(v)
+    navigate(target, { replace: location.pathname === target })
+  }
+  const openSubject = (subject: string) => navigate(studentPath("lessons", slugForSubject(subject, lessonSubjectNames)))
+
   const navItemsWithClick = NAV_ITEMS.map(item => ({
     ...item,
     path: `#${VIEW_MAP[item.label] ?? "dashboard"}`,
-    onClick: () => { if (VIEW_MAP[item.label]) setView(VIEW_MAP[item.label]) },
+    onClick: () => {
+      const target = VIEW_MAP[item.label]
+      if (!target || target === "quiz" || target === "quiz-results") return
+      // Compare addresses, not views: inside a subject or on a not-found page the view equals the
+      // clicked item but the address does not, and a click there must still take the student to the section.
+      if (inProgressView || pathForView(target) !== location.pathname) nav(target)
+    },
   }))
 
-  const nav = (v: View) => { setView(v); if (v !== "lessons") { setLessonSubject(null); setSModules([]); setSModulesKey("") } }
+  useEffect(() => {
+    let title = SECTION_TITLES[view]
+    if (route.kind === "unknown") title = "Page not found"
+    else if (subjectNotFound) title = "Subject not found"
+    else if (view === "lessons" && lessonSubject) title = `${lessonSubject} – Lessons`
+    const previousTitle = document.title
+    document.title = `${title} – TeachScript`
+    return () => { document.title = previousTitle }
+  }, [view, lessonSubject, route.kind, subjectNotFound])
 
   // ── Live coding view shortcut ─────────────────────────────────────────────
   if (view === "live-coding") {
@@ -1030,7 +1237,7 @@ export function StudentDashboard() {
         role="student" userName={user?.name ?? "Student"}
         userSubtitle={myClass ? myClass.label : "Student"}
         userEmail={user?.email ?? ""}
-        activeView="live-coding" navItems={navItemsWithClick}
+        activeView="live-coding" moveFocusOnViewChange navItems={navItemsWithClick}
         instructor={myClass?.teacher_name ? { name: myClass.teacher_name, subject: myClass.label, initials: myClass.teacher_name.split(" ").map(w => w[0]).join("").slice(0,2).toUpperCase() } : undefined}
         classmates={realClassmates}
         onSettingsClick={() => nav("settings")}
@@ -1048,7 +1255,7 @@ export function StudentDashboard() {
       role="student" userName={user?.name ?? "Student"}
       userSubtitle={myClass ? myClass.label : "Student"}
       userEmail={user?.email ?? ""}
-      activeView={view} navItems={navItemsWithClick}
+      activeView={route.kind === "unknown" ? "" : view} moveFocusOnViewChange navItems={navItemsWithClick}
       instructor={myClass?.teacher_name ? { name: myClass.teacher_name, subject: myClass.label, initials: myClass.teacher_name.split(" ").map(w => w[0]).join("").slice(0,2).toUpperCase() } : undefined}
       classmates={realClassmates}
       onSettingsClick={() => nav("settings")}
@@ -1056,30 +1263,56 @@ export function StudentDashboard() {
       studentAttendance={dashSummary?.attendance_rate ?? null}
       onClockIn={refreshDashboard} onClockOut={refreshDashboard}
     >
+      {/* ── UNKNOWN ADDRESS ────────────────────────────────────────────────── */}
+      {route.kind === "unknown" && (
+        <DashboardNotFound
+          title="We can't find that page"
+          message="The link may be out of date. You can go back to your dashboard and pick a section from the menu."
+          actionLabel="Back to Dashboard"
+          onAction={() => nav("dashboard")}
+        />
+      )}
+
       {/* ── DASHBOARD ──────────────────────────────────────────────────────── */}
-      {view === "dashboard" && (
+      {view === "dashboard" && route.kind !== "unknown" && (
         <ViewWrapper id="dashboard">
           <div className="flex flex-col xl:flex-row gap-5">
 
             {/* Main content */}
             <div className="flex-1 flex flex-col gap-5 min-w-0">
 
+              {dashError && (
+                <div role="alert" aria-live="assertive" className="flex items-center justify-between gap-3 px-4 py-3 rounded-[14px]" style={{ background: "rgba(226,75,74,0.08)", border: "1px solid rgba(226,75,74,0.2)" }}>
+                  <p className="text-xs" style={{ color: "#8A2E2C" }}>
+                    ⚠️ {dashError}
+                    <span className="block text-[10px] mt-0.5 opacity-80">The numbers below are from your last visit and may not be up to date.</span>
+                  </p>
+                  <Button
+                    onClick={() => { setDashLoading(true); refreshDashboard() }}
+                    className="cursor-pointer rounded-full px-4 h-10 text-xs font-semibold flex-shrink-0"
+                    style={{ background: "#E24B4A", color: "white" }}
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 mr-1.5"/> Retry
+                  </Button>
+                </div>
+              )}
+
               {/* Hero banner */}
-              <div className="relative rounded-[22px] overflow-hidden" style={{ background: "linear-gradient(135deg,#EEEDF8 0%,#E6F1FB 55%,#EAF7E4 100%)", minHeight: 165 }}>
+              <div className="relative rounded-[22px] overflow-hidden" style={{ background: "var(--gradient-student-hero)", minHeight: 165 }}>
                 <div className="absolute inset-0 opacity-20" style={{ backgroundImage: "radial-gradient(circle, rgba(83,74,183,0.3) 1px, transparent 1px)", backgroundSize: "20px 20px" }}/>
                 <div className="absolute -top-10 -right-10 w-40 h-40 rounded-full opacity-15" style={{ background: "radial-gradient(circle,#534AB7,transparent)" }}/>
                 <div className="absolute -bottom-8 right-32 w-24 h-24 rounded-full opacity-10" style={{ background: "radial-gradient(circle,#378ADD,transparent)" }}/>
                 <div className="relative z-10 flex items-center justify-between px-6 py-5 gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="text-[11px] font-black uppercase tracking-widest mb-1.5 opacity-70" style={{ color: "#534AB7" }}>Welcome back 👋</p>
-                    <h1 className="text-xl md:text-2xl font-black mb-1.5 leading-tight" style={{ color: "#1a1a2e" }}>
+                    <p className="text-[11px] font-black uppercase tracking-widest mb-1.5" style={{ color: "var(--ts-purple-dark, #534AB7)" }}>Welcome back 👋</p>
+                    <h1 className="text-xl md:text-2xl font-black mb-1.5 leading-tight" style={{ color: "var(--foreground)" }}>
                       Unlock Your Full<br/>
                       <span style={{ background: "linear-gradient(135deg,#534AB7,#378ADD)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", backgroundClip: "text" }}>
                         Potential Today!
                       </span>
                     </h1>
-                    <p className="text-xs mb-4" style={{ color: "#555566" }}>
-                      {myClass ? `${myClass.label} · Computer Science` : "Complete lessons to unlock your potential"}
+                    <p className="text-xs mb-4" style={{ color: "var(--muted-foreground)" }}>
+                      {myClass ? myClass.label : "Complete lessons to unlock your potential"}
                     </p>
                     <Button
                       className="cursor-pointer rounded-full px-5 py-2.5 h-auto text-sm font-bold text-white border-0 shadow-lg"
@@ -1089,7 +1322,7 @@ export function StudentDashboard() {
                       Continue Learning <ArrowRight className="w-3.5 h-3.5 ml-1.5"/>
                     </Button>
                   </div>
-                  <StudentIllustration/>
+                  <StudentIllustration gender={user?.gender}/>
                 </div>
               </div>
 
@@ -1113,15 +1346,30 @@ export function StudentDashboard() {
                     value: dashLoading ? "—" : (dashSummary?.quizzes_taken ?? 0) > 0 ? `${dashSummary!.avg_quiz_score}%` : "—",
                     sub: dashLoading ? "" : `${dashSummary?.quizzes_taken ?? 0} quiz${(dashSummary?.quizzes_taken ?? 0) !== 1 ? "zes" : ""} taken`,
                     icon: "🎯", bg: "rgba(55,138,221,0.1)", accent: "#378ADD", delay: "120ms",
+                    onClick: () => nav("quizzes"),
                   },
                   {
                     label: "Attendance",
                     value: dashLoading ? "—" : `${dashSummary?.attendance_rate ?? 0}%`,
-                    sub: dashLoading ? "" : `${dashSummary?.days_present ?? 0} of ${dashSummary?.days_total ?? 0} days`,
+                    sub: dashLoading ? "" : `${dashSummary?.days_present ?? 0}/${dashSummary?.days_total ?? 0} periods · ${dashSummary?.days_recorded ?? 0} day${(dashSummary?.days_recorded ?? 0) !== 1 ? "s" : ""}`,
+                    note: dashBasisText,
                     icon: "📅", bg: "rgba(83,74,183,0.1)", accent: "#534AB7", delay: "180ms",
+                    onClick: () => nav("attendance"),
                   },
                 ].map(s => (
-                  <div key={s.label} className="skillio-card p-4 cursor-default" style={{ animationDelay: s.delay }}>
+                  <div
+                    key={s.label}
+                    onClick={s.onClick}
+                    role={s.onClick ? "button" : undefined}
+                    tabIndex={s.onClick ? 0 : undefined}
+                    aria-label={s.onClick ? `${s.label}: ${s.value}. View details` : undefined}
+                    onKeyDown={s.onClick ? (e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); s.onClick!() } }) : undefined}
+                    className={`skillio-card p-4 transition-transform relative ${s.onClick ? "cursor-pointer hover:scale-[1.02] hover:shadow-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2" : "cursor-default"}`}
+                    style={{ animationDelay: s.delay, ...(s.onClick ? { outlineColor: s.accent } : {}) }}
+                  >
+                    {s.onClick && (
+                      <ChevronRight className="w-3.5 h-3.5 absolute top-4 right-4 opacity-40" style={{ color: s.accent }}/>
+                    )}
                     <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl mb-3" style={{ background: s.bg }}>
                       {s.icon}
                     </div>
@@ -1130,6 +1378,7 @@ export function StudentDashboard() {
                       {dashLoading ? <span className="animate-pulse text-muted-foreground text-sm">Loading…</span> : s.value}
                     </p>
                     <p className="text-[11px] text-muted-foreground">{s.sub}</p>
+                    {s.note ? <p className="text-[10px] text-muted-foreground mt-0.5">{s.note}</p> : null}
                   </div>
                 ))}
               </div>
@@ -1259,10 +1508,10 @@ export function StudentDashboard() {
                     {dashSummary.continue_learning.map((mod, i) => {
                       const pct  = mod.total > 0 ? Math.round((mod.completed / mod.total) * 100) : 0
                       const meta = getSubjectMeta(mod.subject)
-                      const gradients = ["linear-gradient(135deg,#EEEDF8,#E6F1FB)", "linear-gradient(135deg,#EAF3DE,#E6F1FB)", "linear-gradient(135deg,#F5F4F0,#EEEDF8)"]
+                      const gradients = ["var(--gradient-lesson-card-1)", "var(--gradient-lesson-card-2)", "var(--gradient-lesson-card-3)"]
                       return (
                         <div key={mod.module_id} className="skillio-card lesson-card-lift overflow-hidden cursor-pointer"
-                          onClick={() => { setLessonSubject(mod.subject); nav("lessons") }}>
+                          onClick={() => openSubject(mod.subject)}>
                           <div className="h-24 flex items-center justify-center relative overflow-hidden" style={{ background: gradients[i % 3] }}>
                             <span className={meta.iconColor}>
                               <SubjectIcon name={mod.subject} size={40} />
@@ -1303,34 +1552,125 @@ export function StudentDashboard() {
             <div className="xl:w-72 flex flex-col gap-4 flex-shrink-0">
 
               {/* Events */}
-              <div className="skillio-card p-4" style={{ animationDelay: "100ms" }}>
+              <div className="skillio-card p-4 relative" style={{ animationDelay: "100ms" }}>
                 <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-bold text-foreground flex items-center gap-2">
+                  <button
+                    onClick={() => { setEventCalMonth(new Date(weekAnchor.getFullYear(), weekAnchor.getMonth(), 1)); setShowEventCalendar(v => !v) }}
+                    className="cursor-pointer text-sm font-bold text-foreground flex items-center gap-2 hover:opacity-75 transition-opacity"
+                    aria-label="Pick a date"
+                  >
                     <Calendar className="w-4 h-4 text-ts-amber"/> Events
-                  </h3>
-                  <span className="text-[10px] text-muted-foreground font-semibold">This week</span>
+                  </button>
+                  <div className="flex items-center gap-0.5">
+                    <button
+                      onClick={() => { const d = new Date(weekAnchor); d.setDate(d.getDate() - 7); setWeekAnchor(d); setSelectedWeekDate(null) }}
+                      className="cursor-pointer p-1 rounded-md hover:bg-accent transition-colors"
+                      aria-label="Previous week"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5 text-muted-foreground"/>
+                    </button>
+                    <span className="text-[10px] text-muted-foreground font-semibold px-0.5 whitespace-nowrap">
+                      {isCurrentRealWeek ? "This week" : weekRangeLabel}
+                    </span>
+                    <button
+                      onClick={() => { const d = new Date(weekAnchor); d.setDate(d.getDate() + 7); setWeekAnchor(d); setSelectedWeekDate(null) }}
+                      className="cursor-pointer p-1 rounded-md hover:bg-accent transition-colors"
+                      aria-label="Next week"
+                    >
+                      <ChevronRight className="w-3.5 h-3.5 text-muted-foreground"/>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Clickable week strip */}
                 <div className="flex items-center gap-1 mb-4">
-                  {weekDates.map(w => (
-                    <button
-                      key={w.day}
-                      onClick={() => setSelectedWeekDate(selectedWeekDate === w.date ? null : w.date)}
-                      className="cursor-pointer flex-1 flex flex-col items-center py-1.5 rounded-[10px] transition-all"
-                      style={
-                        w.isToday
-                          ? { background: "linear-gradient(135deg,#534AB7,#378ADD)" }
-                          : selectedWeekDate === w.date
-                          ? { background: "rgba(83,74,183,0.15)", border: "1px solid rgba(83,74,183,0.3)" }
-                          : { background: "transparent" }
-                      }
-                    >
-                      <span className={`text-[10px] font-bold ${w.isToday ? "text-white" : "text-muted-foreground"}`}>{w.day[0]}</span>
-                      <span className={`text-[11px] font-black mt-0.5 ${w.isToday ? "text-white" : selectedWeekDate === w.date ? "text-ts-purple" : "text-foreground"}`}>{w.date}</span>
-                    </button>
-                  ))}
+                  {weekDates.map(w => {
+                    const isSelected = selectedWeekDate?.toDateString() === w.fullDate.toDateString()
+                    return (
+                      <button
+                        key={w.fullDate.toISOString()}
+                        onClick={() => setSelectedWeekDate(isSelected ? null : w.fullDate)}
+                        className="cursor-pointer flex-1 flex flex-col items-center py-1.5 rounded-[10px] transition-all"
+                        style={
+                          w.isToday && !isSelected
+                            ? { background: "linear-gradient(135deg,#534AB7,#378ADD)" }
+                            : isSelected
+                            ? { background: "rgba(83,74,183,0.15)", border: "1px solid rgba(83,74,183,0.3)" }
+                            : { background: "transparent" }
+                        }
+                      >
+                        <span className={`text-[10px] font-bold ${w.isToday && !isSelected ? "text-white" : "text-muted-foreground"}`}>{w.day[0]}</span>
+                        <span className={`text-[11px] font-black mt-0.5 ${w.isToday && !isSelected ? "text-white" : isSelected ? "text-ts-purple" : "text-foreground"}`}>{w.date}</span>
+                      </button>
+                    )
+                  })}
                 </div>
+
+                {/* Calendar date-picker popover — same pattern as My Attendance calendar */}
+                {showEventCalendar && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowEventCalendar(false)} />
+                    <div
+                      className="absolute z-50 top-12 right-0 rounded-2xl p-4 shadow-xl"
+                      style={{ width: 280, background: "var(--card)", border: "1px solid var(--border)" }}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <button
+                          className="cursor-pointer p-1.5 rounded-full hover:bg-accent transition-colors"
+                          onClick={() => setEventCalMonth(new Date(eventCalMonth.getFullYear(), eventCalMonth.getMonth() - 1, 1))}
+                          aria-label="Previous month"
+                        >
+                          <ChevronLeft className="w-4 h-4 text-muted-foreground"/>
+                        </button>
+                        <p className="text-xs font-black">
+                          {eventCalMonth.toLocaleDateString("en-IN", { month: "long", year: "numeric" })}
+                        </p>
+                        <button
+                          className="cursor-pointer p-1.5 rounded-full hover:bg-accent transition-colors"
+                          onClick={() => setEventCalMonth(new Date(eventCalMonth.getFullYear(), eventCalMonth.getMonth() + 1, 1))}
+                          aria-label="Next month"
+                        >
+                          <ChevronRight className="w-4 h-4 text-muted-foreground"/>
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-7 gap-1 text-center mb-1.5">
+                        {["S","M","T","W","T","F","S"].map((d, i) => (
+                          <p key={i} className="text-[9px] font-black text-muted-foreground">{d}</p>
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-7 gap-1">
+                        {(() => {
+                          const dim   = new Date(eventCalMonth.getFullYear(), eventCalMonth.getMonth() + 1, 0).getDate()
+                          const fDay  = new Date(eventCalMonth.getFullYear(), eventCalMonth.getMonth(), 1).getDay()
+                          return [
+                            ...Array(fDay).fill(null).map((_, i) => <div key={`e-${i}`}/>),
+                            ...Array(dim).fill(null).map((_, i) => {
+                              const day  = i + 1
+                              const dt   = new Date(eventCalMonth.getFullYear(), eventCalMonth.getMonth(), day)
+                              const isToday    = dt.toDateString() === today.toDateString()
+                              const isSelected = selectedWeekDate?.toDateString() === dt.toDateString()
+                              return (
+                                <button
+                                  key={day}
+                                  type="button"
+                                  onClick={() => { setWeekAnchor(dt); setSelectedWeekDate(dt); setShowEventCalendar(false) }}
+                                  className="flex items-center justify-center py-1.5 rounded-[8px] transition-all hover:scale-105 cursor-pointer"
+                                  style={{
+                                    background: isSelected ? "#534AB7" : "transparent",
+                                    outline: isToday && !isSelected ? "1.5px solid #534AB7" : "none",
+                                  }}
+                                >
+                                  <p className="text-[11px] font-semibold" style={{ color: isSelected ? "#fff" : "var(--foreground)" }}>{day}</p>
+                                </button>
+                              )
+                            }),
+                          ]
+                        })()}
+                      </div>
+                    </div>
+                  </>
+                )}
+
                 {/* Event list — real notifications, filtered by selected date */}
                 <div className="space-y-1.5">
                   {(() => {
@@ -1338,20 +1678,13 @@ export function StudentDashboard() {
                     const typeColors: Record<string, string> = { announcement: "#534AB7", reminder: "#EF9F27", achievement: "#10b981", alert: "#EF4444", event: "#378ADD" }
                     const typeIcons: Record<string, string>  = { announcement: "📢", reminder: "⏰", achievement: "🏆", alert: "🚨", event: "📅" }
 
-                    // Filter by selected date if one is clicked
-                    const isSelectedDateToday = selectedWeekDate === today.getDate()
-                    const filtered = selectedWeekDate
-                      ? allEvents.filter(evt => {
-                          const evtDate = (evt as { scheduled_at?: string }).scheduled_at
-                          // "Send now" notifications (no date) — show only on today's date
-                          if (!evtDate) return isSelectedDateToday
-                          // Scheduled notifications — show only on their scheduled date
-                          const d = new Date(evtDate)
-                          return d.getDate() === selectedWeekDate &&
-                            d.getMonth() === today.getMonth() &&
-                            d.getFullYear() === today.getFullYear()
-                        })
-                      : allEvents
+                    // Default to today's date when nothing on the week strip is explicitly selected —
+                    // without this, the list showed every notification ever posted (including past/future-dated ones)
+                    const activeDate = selectedWeekDate ?? today
+                    const filtered = allEvents.filter(evt => {
+                      const d = new Date(evt.created_at)
+                      return d.toDateString() === activeDate.toDateString()
+                    })
 
                     if (filtered.length === 0) {
                       return (
@@ -1369,22 +1702,23 @@ export function StudentDashboard() {
 
                     return filtered.map((evt, i) => {
                       const color = typeColors[evt.type] ?? "#534AB7"
-                      const evtDate = (evt as { scheduled_at?: string }).scheduled_at
                       return (
-                        <div key={i} className="flex items-center gap-2.5 p-2.5 rounded-[10px] bg-accent/30">
+                        <button
+                          key={i}
+                          onClick={() => setExpandedEvent({ title: evt.title, message: evt.message, type: evt.type, color, icon: typeIcons[evt.type] ?? "📢", scheduled_at: evt.created_at })}
+                          className="cursor-pointer w-full flex items-center gap-2.5 p-2.5 rounded-[10px] bg-accent/30 hover:bg-accent/50 transition-colors text-left"
+                        >
                           <div className="w-8 h-8 rounded-xl flex items-center justify-center text-base flex-shrink-0" style={{ background: `${color}18` }}>
                             {typeIcons[evt.type] ?? "📢"}
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="text-xs font-bold text-foreground leading-tight truncate">{evt.title}</p>
                             <p className="text-[10px] text-muted-foreground truncate">{evt.message}</p>
-                            {evtDate && (
-                              <p className="text-[10px] text-ts-blue mt-0.5">
-                                📅 {new Date(evtDate).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" })}
-                              </p>
-                            )}
+                            <p className="text-[10px] text-ts-blue mt-0.5">
+                              📅 {new Date(evt.created_at).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" })}
+                            </p>
                           </div>
-                        </div>
+                        </button>
                       )
                     })
                   })()}
@@ -1471,6 +1805,42 @@ export function StudentDashboard() {
           sum + m.items.filter(i => sViewedIds.includes(i._id)).length, 0
         )
 
+        // A link to a subject that is not in this class (or an outdated link) gets a friendly message;
+        // while the subject list is still loading we show a loading state instead of guessing.
+        if (subjectNotFound) {
+          return (
+            <ViewWrapper id="lessons">
+              <DashboardNotFound
+                title="We can't find that subject"
+                message="That subject isn't in your class, or the link is out of date."
+                actionLabel="Back to Lessons"
+                onAction={() => nav("lessons")}
+              />
+            </ViewWrapper>
+          )
+        }
+        if (subjectLoadFailed) {
+          return (
+            <ViewWrapper id="lessons">
+              <div role="alert" className="skillio-card flex flex-col items-center gap-3 px-6 py-10 text-center">
+                <p className="text-sm text-foreground">We couldn't load your subjects. Check your connection and try again.</p>
+                <Button type="button" onClick={retrySubjects} className="cursor-pointer rounded-full px-5">
+                  <RotateCcw className="w-3.5 h-3.5 mr-1.5" aria-hidden="true" /> Retry
+                </Button>
+              </div>
+            </ViewWrapper>
+          )
+        }
+        if (subjectPending) {
+          return (
+            <ViewWrapper id="lessons">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground py-10 justify-center">
+                <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Loading lessons…
+              </div>
+            </ViewWrapper>
+          )
+        }
+
         return (
           <ViewWrapper id="lessons">
             <div className="flex flex-col gap-4">
@@ -1499,7 +1869,7 @@ export function StudentDashboard() {
               {/* Header */}
               <div className="flex items-center gap-3">
                 {lessonSubject && (
-                  <button onClick={() => { setLessonSubject(null); setSModules([]); setSModulesKey("") }}
+                  <button onClick={() => nav("lessons")}
                     className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors group">
                     <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
                     Subjects
@@ -1533,7 +1903,7 @@ export function StudentDashboard() {
                       const pct   = total > 0 ? Math.round((done / total) * 100) : 0
                       return (
                         <button key={idx}
-                          onClick={() => setLessonSubject(subj)}
+                          onClick={() => openSubject(subj)}
                           className={[
                             "group flex flex-col items-start gap-3 p-4 rounded-2xl border bg-card skillio-card",
                             "hover:shadow-md hover:-translate-y-0.5 transition-all duration-200",
@@ -1569,85 +1939,25 @@ export function StudentDashboard() {
                 )
               )}
 
-              {/* Module list for selected subject */}
+              {/* Module list + item panel for selected subject */}
               {lessonSubject && (
-                sModulesLoading ? (
-                  <SkeletonList count={3} lines={2} />
-                ) : sModules.length === 0 ? (
-                  <div className="flex flex-col items-center py-12 gap-3 text-center">
-                    <div className={`w-14 h-14 rounded-2xl flex items-center justify-center bg-gradient-to-br ${getSubjectMeta(lessonSubject).gradient} opacity-30`}>
-                      <SubjectIcon name={lessonSubject} size={26} />
-                    </div>
-                    <div>
-                      <p className="text-sm font-semibold text-foreground">No modules yet</p>
-                      <p className="text-xs text-muted-foreground mt-1 max-w-xs">
-                        Your teacher hasn't uploaded any content for <span className="font-medium text-foreground">{lessonSubject}</span> yet.
-                      </p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex flex-col gap-3">
-                    {sModules.map(mod => {
-                      const viewedCount = mod.items.filter(i => sViewedIds.includes(i._id)).length
-                      return (
-                        <div key={mod._id} className="skillio-card rounded-xl border border-border overflow-hidden">
-                          {/* Module header */}
-                          <div className="flex items-center justify-between px-4 py-3 bg-muted/40 border-b border-border">
-                            <span className="text-xs font-bold text-foreground">{mod.title}</span>
-                            <span className="text-[10px] text-muted-foreground">{viewedCount}/{mod.items.length} viewed</span>
-                          </div>
-                          {/* Items */}
-                          <div className="divide-y divide-border">
-                            {mod.items.map(item => {
-                              const viewed = sViewedIds.includes(item._id)
-                              return (
-                                <button key={item._id}
-                                  className="w-full flex items-center gap-2.5 px-4 py-2.5 hover:bg-muted/30 transition-colors text-left group"
-                                  onClick={async () => {
-                                    if (!viewed) {
-                                      setSViewedIds(ids => [...ids, item._id])
-                                      await markItemViewed(mod._id, item._id)
-                                      pingActivity("item_viewed")
-                                      // Optimistic update: increment progress bar immediately
-                                      setDashSummary(prev => {
-                                        if (!prev) return prev
-                                        return {
-                                          ...prev,
-                                          modules_completed: prev.modules_completed + 1,
-                                          module_progress: prev.module_progress.map(p =>
-                                            p.subject === mod.subject
-                                              ? { ...p, completed: Math.min(p.completed + 1, p.total) }
-                                              : p
-                                          ),
-                                        }
-                                      })
-                                    }
-                                    setSViewerItem(item)
-                                  }}>
-                                  <span className="text-base shrink-0">{item.type === "file" ? fileIcon(item.file_type) : linkIcon(item.link_type)}</span>
-                                  <div className="flex-1 min-w-0">
-                                    <p className="text-xs font-medium text-foreground truncate group-hover:text-ts-purple transition-colors">{item.label}</p>
-                                    {item.type === "file" && item.file_size && (
-                                      <p className="text-[10px] text-muted-foreground">{item.file_type?.toUpperCase()} · {formatFileSize(item.file_size)}</p>
-                                    )}
-                                    {item.type === "link" && (
-                                      <p className="text-[10px] text-muted-foreground truncate">{item.link_url}</p>
-                                    )}
-                                  </div>
-                                  {viewed ? (
-                                    <span className="text-[10px] font-semibold text-green-600 dark:text-green-400 shrink-0">✓ Viewed</span>
-                                  ) : (
-                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-ts-purple text-white shrink-0">New</span>
-                                  )}
-                                </button>
-                              )
-                            })}
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )
+                <StudentLessonsItemsPanel
+                  lessonSubject={lessonSubject}
+                  sModules={sModules}
+                  sModulesLoading={sModulesLoading || !myClass?.id}
+                  sViewedIds={sViewedIds}
+                  setSViewedIds={setSViewedIds}
+                  selectedModuleId={selectedModuleId}
+                  setSelectedModuleId={setSelectedModuleId}
+                  itemSearchQuery={itemSearchQuery}
+                  setItemSearchQuery={setItemSearchQuery}
+                  itemStatusFilter={itemStatusFilter}
+                  setItemStatusFilter={setItemStatusFilter}
+                  markingDoneId={markingDoneId}
+                  setMarkingDoneId={setMarkingDoneId}
+                  setSViewerItem={setSViewerItem}
+                  setDashSummary={setDashSummary}
+                />
               )}
             </div>
           </ViewWrapper>
@@ -1711,6 +2021,9 @@ export function StudentDashboard() {
                       setSubmittingQuiz(false)
                       if (!("error" in res)) {
                         setQuizAttemptResult(res)
+                        // Quiz average and points changed — the next Dashboard visit reloads them
+                        dashFetchedAtRef.current = 0
+                        extrasFetchedAtRef.current = 0
                         setQuizHistory(prev => [{
                           _id: res.attempt._id, quiz_title: activeQuiz.title,
                           score: res.attempt.score, total: res.attempt.total,
@@ -1913,20 +2226,45 @@ export function StudentDashboard() {
       {view === "certificates" && (
         <ViewWrapper id="certificates">
           <div className="flex flex-col gap-5">
-            <h1 className="text-base font-black text-foreground">Certificates</h1>
+            <div>
+              <h1 className="text-base font-black text-foreground">Certificates</h1>
+              <p className="text-xs text-muted-foreground mt-0.5">Your teacher issues a certificate when you complete a subject.</p>
+            </div>
             {certsLoading ? (
               <SkeletonList count={4} lines={2} showAvatar />
+            ) : certsError ? (
+              <div className="skillio-card p-6 text-center" role="alert">
+                <p className="text-sm font-semibold text-foreground">We couldn't load your certificates.</p>
+                <Button size="sm" variant="outline" className="mt-3 rounded-full text-xs" onClick={() => { setCertsError(false); setCertsLoaded(false) }}>
+                  Try again
+                </Button>
+              </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {/* Earned certificates */}
                 {realCerts.map(cert => {
                   const isCustom  = cert.type === "custom"
+                  const revoked   = isRevoked(cert)
                   const titleText = isCustom ? cert.custom_title : cert.module_title
                   const subText   = isCustom ? cert.custom_reason : `${cert.class_label} · ${cert.subject}`
-                  const gradient  = isCustom
+                  const gradient  = revoked
+                    ? "linear-gradient(135deg,#9CA3AF,#6B7280)"
+                    : isCustom
                     ? "linear-gradient(135deg,#F59E0B,#D97706)"
                     : "linear-gradient(135deg,#534AB7,#378ADD)"
-                  const borderColor = isCustom ? "rgba(245,158,11,0.35)" : "rgba(83,74,183,0.3)"
+                  const borderColor = revoked ? "var(--border)" : isCustom ? "rgba(245,158,11,0.35)" : "rgba(83,74,183,0.3)"
+                  if (revoked) return (
+                    <div key={cert._id} className="skillio-card p-6 flex flex-col gap-3 relative overflow-hidden" style={{ border: `2px solid ${borderColor}` }}>
+                      <div className="absolute top-0 left-0 right-0 h-1.5 rounded-t-[16px]" style={{ background: gradient }}/>
+                      <span className="inline-block w-fit text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-muted text-muted-foreground">Revoked</span>
+                      <div>
+                        <p className="text-xs font-bold text-foreground mb-1 line-through decoration-muted-foreground/60">{titleText}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {subText}{cert.revoked_at ? ` · Revoked on ${new Date(cert.revoked_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}` : ""}
+                        </p>
+                        {cert.revoke_reason && <p className="text-xs text-muted-foreground mt-1">Reason: {cert.revoke_reason}</p>}
+                      </div>
+                    </div>
+                  )
                   return (
                     <div key={cert._id} className="skillio-card p-6 flex flex-col gap-4 relative overflow-hidden animate-purple-glow" style={{ border: `2px solid ${borderColor}` }}>
                       <div className="absolute top-0 left-0 right-0 h-1.5 rounded-t-[16px]" style={{ background: gradient }}/>
@@ -1961,42 +2299,11 @@ export function StudentDashboard() {
                   )
                 })}
 
-                {/* Eligible to claim — subject level */}
-                {eligibleCerts.map(subj => (
-                  <div key={subj.subject} className="skillio-card p-6 flex flex-col gap-4 relative overflow-hidden" style={{ border: "2px solid rgba(99,153,34,0.3)" }}>
-                    <div className="absolute top-0 left-0 right-0 h-1.5 rounded-t-[16px]" style={{ background: "linear-gradient(135deg,#639922,#1FA04C)" }}/>
-                    <div className="flex items-center gap-3">
-                      <div className="w-14 h-14 rounded-full flex items-center justify-center text-3xl shadow-lg" style={{ background: "rgba(99,153,34,0.12)" }}>🎉</div>
-                      <div>
-                        <p className="text-[11px] font-black text-ts-green uppercase tracking-widest mb-0.5">Subject Complete!</p>
-                        <p className="text-sm font-black text-foreground">{subj.subject}</p>
-                      </div>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      You finished all {subj.modules_count} module{subj.modules_count !== 1 ? "s" : ""} ({subj.total_items_count} items) in {subj.subject}. Claim your subject certificate!
-                    </p>
-                    <Button className="cursor-pointer rounded-full text-xs w-fit font-bold text-white border-0"
-                      style={{ background: "linear-gradient(135deg,#639922,#1FA04C)" }}
-                      disabled={claimingId === subj.subject}
-                      onClick={async () => {
-                        setClaimingId(subj.subject)
-                        const res = await claimCertificate(subj.subject)
-                        setClaimingId(null)
-                        if (!("error" in res)) {
-                          setRealCerts(prev => [...prev, res.certificate])
-                          setEligibleCerts(prev => prev.filter(e => e.subject !== subj.subject))
-                        }
-                      }}>
-                      {claimingId === subj.subject ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5"/>Claiming…</> : "🏆 Claim Subject Certificate"}
-                    </Button>
-                  </div>
-                ))}
-
-                {realCerts.length === 0 && eligibleCerts.length === 0 && (
+                {realCerts.length === 0 && (
                   <div className="sm:col-span-2 skillio-card p-8 text-center">
                     <p className="text-2xl mb-2">🎓</p>
                     <p className="text-sm font-semibold text-foreground">No certificates yet</p>
-                    <p className="text-xs text-muted-foreground mt-1">Complete all modules in a subject to earn your subject completion certificate.</p>
+                    <p className="text-xs text-muted-foreground mt-1">Finish every lesson in a subject — your teacher will then issue your certificate.</p>
                     <Button size="sm" className="mt-4 rounded-full text-xs text-white border-0" style={{ background: "linear-gradient(135deg,#534AB7,#378ADD)" }} onClick={() => nav("lessons")}>
                       Start Learning →
                     </Button>
@@ -2029,6 +2336,11 @@ export function StudentDashboard() {
               </Button>
             </div>
 
+            {/* Where the figures below are counted from (from the server) */}
+            {attBasisText && (
+              <p className="text-xs text-muted-foreground -mt-2">{attBasisText}</p>
+            )}
+
             {/* ── Time-range summary chips ── */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               {(
@@ -2049,12 +2361,12 @@ export function StudentDashboard() {
                   <div key={key} className="skillio-card p-4 flex flex-col gap-1">
                     <div>
                       <p className="text-xs font-black text-muted-foreground uppercase tracking-wider">{label}</p>
-                      <p className="text-[11px] text-muted-foreground mt-0.5 leading-tight">{chipRanges[key]}</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5 leading-tight">{chipInfo[key].range}</p>
                     </div>
                     {!attLoaded ? (
                       <div className="h-7 w-14 bg-muted animate-pulse rounded-md mt-1" />
                     ) : !slot?.recorded ? (
-                      <p className="text-xs font-semibold text-muted-foreground mt-1">Not recorded</p>
+                      <p className="text-xs font-semibold text-muted-foreground mt-1">{chipInfo[key].empty}</p>
                     ) : (
                       <>
                         <p className="text-2xl font-black leading-none mt-0.5" style={{ color: rateColor }}>{slot.rate}%</p>
@@ -2111,7 +2423,7 @@ export function StudentDashboard() {
               {rangeQueried && (
                 <div className="mt-3 rounded-[10px] p-3" style={{ background: "rgba(83,74,183,0.06)" }}>
                   {!rangeResult?.recorded ? (
-                    <p className="text-xs text-muted-foreground">No attendance recorded in this period.</p>
+                    <p className="text-xs text-muted-foreground">{rangeEmpty}</p>
                   ) : (
                     <div className="flex items-center justify-between gap-4">
                       <div>
@@ -2218,7 +2530,7 @@ export function StudentDashboard() {
               </p>
               {selectedDateRecords.length === 0 ? (
                 <p className="text-xs text-muted-foreground text-center py-2">
-                  {attLoaded ? "No attendance recorded for this date." : "Loading…"}
+                  {selectedDateEmpty}
                 </p>
               ) : (
                 <div className="flex flex-col gap-2">
@@ -2297,20 +2609,18 @@ export function StudentDashboard() {
                     <div key={teacher.id}
                       className="skillio-card p-5 flex items-start gap-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_6px_24px_rgba(83,74,183,0.12)]">
                       {/* Avatar */}
-                      {teacher.profile_photo_url ? (
-                        <img
-                          src={teacher.profile_photo_url}
-                          alt={teacher.name}
-                          className="w-14 h-14 rounded-full object-cover flex-shrink-0 border-2 border-border"
-                        />
-                      ) : (
-                        <div
-                          className="w-14 h-14 rounded-full flex items-center justify-center text-base font-black text-white flex-shrink-0"
-                          style={{ background: "linear-gradient(135deg,#534AB7,#7970D6)" }}
-                        >
-                          {initials}
-                        </div>
-                      )}
+                      <UserPhoto
+                        path={teacher.photo_url}
+                        className="w-14 h-14 rounded-full object-cover flex-shrink-0 border-2 border-border"
+                        fallback={
+                          <div
+                            className="w-14 h-14 rounded-full flex items-center justify-center text-base font-black text-white flex-shrink-0"
+                            style={{ background: "linear-gradient(135deg,#534AB7,#7970D6)" }}
+                          >
+                            {initials}
+                          </div>
+                        }
+                      />
 
                       {/* Info */}
                       <div className="flex-1 min-w-0">
@@ -2447,6 +2757,48 @@ export function StudentDashboard() {
         </ViewWrapper>
       )}
 
+      {/* ── EVENT / NOTIFICATION DETAIL MODAL ───────────────────────────────── */}
+      {expandedEvent && createPortal(
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+          style={{ animation: "modalBackdropIn 0.18s ease-out" }}
+          onClick={() => setExpandedEvent(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-[20px] overflow-hidden bg-card border border-border shadow-2xl"
+            style={{ animation: "modalPopIn 0.22s cubic-bezier(0.16,1,0.3,1)" }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="relative px-5 pt-5 pb-4" style={{ background: `${expandedEvent.color}12` }}>
+              <div className="absolute top-0 left-0 right-0 h-1" style={{ background: expandedEvent.color }} />
+              <button
+                onClick={() => setExpandedEvent(null)}
+                className="cursor-pointer absolute top-3 right-3 w-7 h-7 rounded-full flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+              <div
+                className="w-11 h-11 rounded-2xl flex items-center justify-center text-xl mb-3 shadow-sm"
+                style={{ background: expandedEvent.color }}
+              >
+                {expandedEvent.icon}
+              </div>
+              <h3 className="text-base font-bold text-foreground leading-snug pr-8">{expandedEvent.title}</h3>
+              {expandedEvent.scheduled_at && (
+                <p className="text-[11px] font-semibold mt-1.5" style={{ color: expandedEvent.color }}>
+                  📅 {new Date(expandedEvent.scheduled_at).toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}
+                </p>
+              )}
+            </div>
+            <div className="px-5 py-4">
+              <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">{expandedEvent.message}</p>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* ── FILE / LINK VIEWER OVERLAY (student) ────────────────────────────── */}
       {sViewerItem && createPortal(
         <div className="fixed inset-0 z-50 flex flex-col bg-background">
@@ -2469,47 +2821,44 @@ export function StudentDashboard() {
 
               // All file items use pre-fetched blob URLs (auth token never in URL)
               if (sViewerItem.type === "file") {
-                if (sViewerBlobLoading) return (
-                  <div className="flex items-center justify-center h-full gap-3 text-muted-foreground text-sm">
+                const slideState = slideConversionState(sViewerItem)
+                if (slideState === "converting" || slideState === "failed") return (
+                  <div className="flex items-center justify-center h-full bg-muted/20 p-4">
+                    <div role="status" className="flex flex-col items-center gap-4 p-8 rounded-2xl bg-card border border-border shadow-sm max-w-sm text-center">
+                      <span className="text-5xl" aria-hidden="true">📊</span>
+                      <div>
+                        <p className="text-base font-semibold text-foreground">{sViewerItem.label}</p>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {slideState === "converting"
+                            ? "This lesson is being prepared. Please check back in a few minutes."
+                            : "This lesson isn't ready to view yet. Please ask your teacher."}
+                        </p>
+                      </div>
+                      {slideState === "converting" && (
+                        <Button size="sm" className="text-xs rounded-full" disabled={slideChecking} onClick={() => recheckSlideConversion(sViewerItem)}>
+                          {slideChecking ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Checking…</> : "Check again"}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )
+                if (isStreamedVideo(sViewerItem)) return <LessonVideo key={sViewerItem._id} item={sViewerItem} />
+                if (sViewerBlobLoading || (!sViewerBlobUrl && !sViewerFailed)) return (
+                  <div role="status" className="flex items-center justify-center h-full gap-3 text-muted-foreground text-sm">
                     <span className="animate-spin text-lg">⏳</span> Loading file…
                   </div>
                 )
-                if (!sViewerBlobUrl) return (
-                  <div className="flex items-center justify-center h-full text-muted-foreground text-sm">Failed to load file.</div>
+                if (sViewerFailed || !sViewerBlobUrl) return (
+                  <div role="alert" className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground text-sm">
+                    <p>This file could not be loaded. Please check your connection and try again.</p>
+                    <Button size="sm" variant="outline" onClick={() => setSViewerRetry(n => n + 1)}>Try again</Button>
+                  </div>
                 )
 
                 if (["jpg","jpeg","png","webp","gif"].includes(ft)) {
                   return (
                     <div className="flex items-center justify-center h-full p-4 bg-muted/30">
                       <img src={sViewerBlobUrl} alt={sViewerItem.label} className="max-h-full max-w-full object-contain rounded-xl shadow-lg" />
-                    </div>
-                  )
-                }
-                if (["mp4","webm"].includes(ft)) {
-                  return (
-                    <div className="flex items-center justify-center h-full bg-black">
-                      <video src={sViewerBlobUrl} controls className="max-h-full max-w-full" />
-                    </div>
-                  )
-                }
-                if (needsDownloadFallback(sViewerItem)) {
-                  return (
-                    <div className="flex items-center justify-center h-full bg-muted/20">
-                      <div className="flex flex-col items-center gap-5 p-8 rounded-2xl bg-card border border-border shadow-sm max-w-sm text-center">
-                        <span className="text-5xl">📊</span>
-                        <div>
-                          <p className="text-base font-semibold text-foreground">{sViewerItem.label}</p>
-                          <p className="text-xs text-muted-foreground mt-1">PPTX · PDF preview not yet generated</p>
-                        </div>
-                        <a
-                          href={sViewerBlobUrl}
-                          download={sViewerItem.file_name ?? sViewerItem.label}
-                          className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium text-white transition-opacity hover:opacity-90"
-                          style={{ background: "var(--ts-blue)" }}
-                        >
-                          Download to open
-                        </a>
-                      </div>
                     </div>
                   )
                 }

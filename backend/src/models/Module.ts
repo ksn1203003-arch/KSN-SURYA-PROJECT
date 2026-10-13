@@ -8,6 +8,9 @@ import mongoose, { type Document, type Model } from "mongoose"
 
 export type ItemType = "file" | "link"
 export type LinkType = "gdrive" | "youtube" | "other"
+// PPT/PPTX → PDF conversion state. Conversion runs once, at upload (or once in the
+// repair script for older files) — never on view or at server start.
+export type ConversionStatus = "pending" | "ready" | "failed"
 
 export interface IModuleItem {
   _id: mongoose.Types.ObjectId
@@ -17,6 +20,7 @@ export interface IModuleItem {
   // file fields
   gridfs_id: mongoose.Types.ObjectId | null
   pdf_gridfs_id: mongoose.Types.ObjectId | null  // PDF version of PPTX/PPT for inline viewing
+  conversion_status: ConversionStatus | null      // only set for PPT/PPTX items
   file_name: string | null
   file_type: string | null  // "pdf", "pptx", "ppt", "mp4", "jpg", etc.
   file_size: number | null  // bytes
@@ -43,6 +47,7 @@ const moduleItemSchema = new mongoose.Schema<IModuleItem>({
   label:         { type: String, required: true },
   gridfs_id:     { type: mongoose.Schema.Types.ObjectId, default: null },
   pdf_gridfs_id: { type: mongoose.Schema.Types.ObjectId, default: null },
+  conversion_status: { type: String, enum: ["pending", "ready", "failed", null], default: null },
   file_name:     { type: String, default: null },
   file_type:     { type: String, default: null },
   file_size:     { type: Number, default: null },

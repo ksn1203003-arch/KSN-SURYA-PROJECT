@@ -12,8 +12,11 @@ import { ExamDefinition, type IExamDefinition } from "../models/ExamDefinition.j
 import { ExamResult } from "../models/ExamResult.js"
 import { Class } from "../models/Class.js"
 import { School } from "../models/School.js"
-import { calculateAttendanceRate } from "../lib/attendanceHelpers.js"
+import { calculateAttendanceRate, attendanceDateFilter, classLabelOf, isYmd } from "../lib/attendanceHelpers.js"
 
+// Attendance on a report card counts only the sheets dated on/after the class's stored school-year start
+// (`countedFrom`; null = the class has no stored start, so every sheet counts). A class that cannot be found
+// inside the student's school gives attPct null and no countedFrom / countedClassLabel.
 export interface ReportCardData {
   studentName: string
   classLabel:  string
@@ -22,6 +25,8 @@ export interface ReportCardData {
   exams:       IExamDefinition[]
   resultMap:   Record<string, Record<string, { marks_obtained: number | null; is_absent: boolean }>>
   attPct:      number | null
+  countedFrom?:       string | null
+  countedClassLabel?: string | null
 }
 
 interface StudentDoc {
@@ -38,13 +43,17 @@ export async function fetchReportCardData(
   const studentOid = new mongoose.Types.ObjectId(studentId)
 
   const [cls, school, exams] = await Promise.all([
-    Class.findById(student.class_id).select("name grade section").lean(),
+    // The class is looked up inside the student's own school; a class of another school is "not found"
+    student.class_id && student.school_id
+      ? Class.findOne({ _id: student.class_id, school_id: student.school_id }).select("name grade section year_start").lean()
+      : Promise.resolve(null),
     School.findById(student.school_id).select("name board").lean(),
     ExamDefinition.find({
       school_id: student.school_id,
       class_id:  student.class_id,
     }).sort({ date: 1 }).lean(),
   ])
+  const countedStart = cls && isYmd(cls.year_start) ? cls.year_start : null
 
   const examIds = exams.map(e => e._id)
   const results = await ExamResult.find({
@@ -64,9 +73,9 @@ export async function fetchReportCardData(
   // by the $match stage; $unwind+$match then narrows to exactly this student.
   const db = mongoose.connection.db
   let presentCount = 0; let lateCount = 0; let totalCount = 0
-  if (db) {
+  if (db && cls) {
     const [agg] = await db.collection("attendances").aggregate([
-      { $match: { class_id: student.class_id, "records.student_id": studentOid } },
+      { $match: { class_id: student.class_id, "records.student_id": studentOid, ...attendanceDateFilter(countedStart) } },
       { $unwind: "$records" },
       { $match: { "records.student_id": studentOid } },
       { $group: {
@@ -92,7 +101,9 @@ export async function fetchReportCardData(
     schoolBoard: school?.board ?? "",
     exams,
     resultMap,
-    attPct: calculateAttendanceRate(presentCount, lateCount, totalCount),
+    attPct: cls ? calculateAttendanceRate(presentCount, lateCount, totalCount) : null,
+    countedFrom:       cls ? countedStart : null,
+    countedClassLabel: cls ? classLabelOf(cls) : null,
   }
 }
 
@@ -109,6 +120,8 @@ export interface BatchReportCardEntry {
   exams:       IExamDefinition[]
   resultMap:   Record<string, Record<string, { marks_obtained: number | null; is_absent: boolean }>>
   attPct:      number | null
+  countedFrom?:       string | null
+  countedClassLabel?: string | null
 }
 
 export async function fetchReportCardDataBatch(
@@ -123,12 +136,17 @@ export async function fetchReportCardDataBatch(
 
   // Fetch class, school, and exams once for the whole batch
   const [cls, school, exams] = await Promise.all([
-    Class.findById(classId).select("name grade section").lean(),
+    // The class is looked up inside the students' own school; a class of another school is "not found"
+    classId && schoolId
+      ? Class.findOne({ _id: classId, school_id: schoolId }).select("name grade section year_start").lean()
+      : Promise.resolve(null),
     School.findById(schoolId).select("name board").lean(),
     ExamDefinition.find({ school_id: schoolId, class_id: classId }).sort({ date: 1 }).lean(),
   ])
 
   const classLabel = cls ? (cls.name || `Class ${cls.grade}${cls.section}`) : ""
+  const countedStart = cls && isYmd(cls.year_start) ? cls.year_start : null
+  const countedClassLabel = cls ? classLabelOf(cls) : null
   const schoolName  = school?.name  ?? "School"
   const schoolBoard = school?.board ?? ""
   const examIds     = exams.map(e => e._id)
@@ -154,9 +172,9 @@ export async function fetchReportCardDataBatch(
   // Fetch attendance for all students in one aggregation pipeline
   const db = mongoose.connection.db
   const attByStudent = new Map<string, { present: number; late: number; total: number }>()
-  if (db) {
+  if (db && cls) {
     const attAgg = await db.collection("attendances").aggregate([
-      { $match: { class_id: classId, "records.student_id": { $in: studentIds } } },
+      { $match: { class_id: classId, "records.student_id": { $in: studentIds }, ...attendanceDateFilter(countedStart) } },
       { $unwind: "$records" },
       { $match: { "records.student_id": { $in: studentIds } } },
       { $group: {
@@ -176,7 +194,7 @@ export async function fetchReportCardDataBatch(
   return students.map(s => {
     const sid     = s._id.toString()
     const att     = attByStudent.get(sid) ?? { present: 0, late: 0, total: 0 }
-    const attPct  = calculateAttendanceRate(att.present, att.late, att.total)
+    const attPct  = cls ? calculateAttendanceRate(att.present, att.late, att.total) : null
     return {
       studentId:   sid,
       studentName: s.name,
@@ -186,6 +204,8 @@ export async function fetchReportCardDataBatch(
       exams,
       resultMap: resultsByStudent.get(sid) ?? {},
       attPct,
+      countedFrom:       cls ? countedStart : null,
+      countedClassLabel,
     }
   })
 }

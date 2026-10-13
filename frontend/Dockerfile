@@ -26,9 +26,22 @@ RUN printf 'server {\n\
   location / {\n\
     try_files $uri $uri/ /index.html;\n\
   }\n\
-  location ~* \\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2)$ {\n\
+  location = /index.html {\n\
+    add_header Cache-Control "no-cache";\n\
+  }\n\
+  location ~ ^/(sw|registerSW|workbox-[^/]+)\\.js$ {\n\
+    add_header Cache-Control "no-cache";\n\
+  }\n\
+  location ~ \\.webmanifest$ {\n\
+    add_header Cache-Control "no-cache";\n\
+  }\n\
+  location /assets/ {\n\
     expires 1y;\n\
     add_header Cache-Control "public, immutable";\n\
+  }\n\
+  location ~* \\.(png|jpg|jpeg|gif|svg|ico|webp|woff2)$ {\n\
+    expires 7d;\n\
+    add_header Cache-Control "public";\n\
   }\n\
 }\n' > /etc/nginx/conf.d/default.conf
 

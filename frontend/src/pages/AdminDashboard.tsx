@@ -9,7 +9,7 @@ import { getExams, getExamResults, type ExamDefinition as ExamDef, type ExamResu
 import { getDeletionRequests, reviewDeletionRequest, type DeletionRequest } from "@/lib/dpdpApi"
 import { createPortal } from "react-dom"
 import { TimetableDisplayView } from "@/components/TimetableDisplayView"
-import * as XLSX from "xlsx"
+import { withXlsx } from "@/lib/excel"
 import { DashboardLayout } from "@/components/DashboardLayout"
 import { SkeletonList } from "@/components/SkeletonCard"
 import { Button } from "@/components/ui/button"
@@ -22,25 +22,27 @@ import {
   Copy, CheckCircle, AlertCircle, Loader2, Trash2,
   GraduationCap, School, ChevronDown, ChevronRight,
   TrendingUp, Bell, Send, Megaphone, Clock, AlertTriangle, Info, Trophy, CalendarDays, ChevronUp,
-  Award, Download, Lock, Eye, EyeOff, Palette, RotateCcw,
+  Award, Download, Lock, Eye, EyeOff, Palette, RotateCcw, Ban,
   BarChart3, Star, Activity, BookMarked, FileQuestion, Zap, UserX, CalendarCheck, FileSpreadsheet, UserRound,
 } from "lucide-react"
 import { useAuth } from "@/contexts/AuthContext"
 import AdminOverviewPanel from "@/components/admin/AdminOverviewPanel"
 import AdminClassesPanel from "@/components/admin/AdminClassesPanel"
+import { formatYmdForDisplay, classStartDate, istToday, YEAR_START_CHOOSE_DATE, type ClassRow, type StudentDetail, type YearStartPreview, type BulkYearStartOutcome } from "@/components/admin/adminTypes"
 import AdminTeachersPanel from "@/components/admin/AdminTeachersPanel"
 import AdminStudentsPanel, { ParentsSection } from "@/components/admin/AdminStudentsPanel"
+import { CertificateCompletionPanel } from "@/components/teacher/CertificateCompletionPanel"
 import {
   getSchool, getClasses, createClass, deleteClass,
   getTeachers, getStudents, inviteTeacher, addStudent, updateStudent, updateTeacher,
   bulkAddStudents, bulkInviteTeachers, removeUser, parseStudentFile, parseTeacherFile, updateSchool, updateProfile,
   bulkTransferStudents, bulkSetGender, bulkAssignTeachersToClass, bulkDeleteUsers,
-  getTeacherSessions, setTeacherAssignments, updateClass, saveTimetable,
+  getTeacherSessions, setTeacherAssignments, updateClass, saveTimetable, getYearStartPreview, bulkSetYearStart,
   createNotification, getAdminNotifications, deleteNotification, type NotifType, type AdminNotification,
   changePassword,
   getCertTemplate, saveCertTemplate, uploadCertLogo, deleteCertLogo,
   issueCustomCertificate, revokeCertificate, openCertPreview,
-  getCertsByClass, viewCertPDF, downloadCertPDF, bulkDownloadCerts, deleteCert,
+  getCertsByClass, viewCertPDF, downloadCertPDF,
   getClassStudents, type CertTemplateData, type AdminCertificate,
   getSchoolAttendanceToday, type StudentAttendanceToday,
   getChallenges, downloadComplianceReport,
@@ -88,13 +90,10 @@ interface SchoolData {
 }
 interface Stats { teachers: number; students: number; classes: number }
 interface TimetableSlot { day: string; period: number; subject: string; teacher_id: string | null; start_time: string; end_time: string }
-interface TimetableVersion { updated_by_name: string; updated_at: string; slots: TimetableSlot[] }
-interface ClassRow { id: string; grade: number; section: string; name: string | null; subjects: string[]; teacher_id: string | null; teacher_name: string | null; student_count: number; teachers: Array<{ teacher_id: string; teacher_name: string | null; subject: string }>; timetable: TimetableSlot[]; timetable_updated_by_name?: string | null; timetable_updated_at?: string | null; timetable_versions?: TimetableVersion[] }
-interface TeacherRow { id: string; name: string; email: string; phone: string | null; is_active: boolean; profile_photo_url: string | null; created_at: string | null; class_label: string | null; subject_assignments: Array<{ class_id: string; class_label: string; subject: string }> }
+interface TeacherRow { id: string; name: string; email: string; phone: string | null; is_active: boolean; photo_url: string | null; created_at: string | null; class_label: string | null; subject_assignments: Array<{ class_id: string; class_label: string; subject: string }> }
 interface TeacherDetail { last_login: string | null; sessions_this_month: number; modules_count: number; quizzes_count: number; challenges_count: number; total_students: number; class_details: Array<{ label: string; student_count: number; subjects: string[] }> }
 interface BulkTeacherResult { name: string; email: string; temp_password: string; error?: string }
-interface StudentRow { id: string; name: string; email: string; phone: string | null; username: string | null; gender: string | null; class_id: string | null; class_label: string | null; is_active: boolean; profile_photo_url: string | null; points: number; created_at: string | null }
-interface StudentDetail { attendance_rate: number | null; attendance_breakdown: { present: number; late: number; absent: number; total: number }; last_active: string | null; minutes_active_last_day: number; certificates_count: number; modules_completed: number; quizzes_attempted: number; quiz_avg_score: number | null }
+interface StudentRow { id: string; name: string; email: string; phone: string | null; username: string | null; gender: string | null; class_id: string | null; class_label: string | null; is_active: boolean; photo_url: string | null; points: number; created_at: string | null }
 interface BulkResult { name: string; username: string; temp_password: string; error?: string }
 interface ChallengeRow { _id: string; title: string; difficulty: "Easy" | "Medium" | "Hard"; language: string; description: string; class_id: string; deadline: string | null; is_active: boolean; created_at: string }
 type AttPeriod = "today" | "week" | "month" | "year" | "custom"
@@ -187,10 +186,12 @@ function Spinner() {
 }
 
 function downloadExcel(rows: Record<string, string>[], filename: string) {
-  const ws = XLSX.utils.json_to_sheet(rows)
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, "Credentials")
-  XLSX.writeFile(wb, filename)
+  withXlsx(filename, XLSX => {
+    const ws = XLSX.utils.json_to_sheet(rows)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, "Credentials")
+    XLSX.writeFile(wb, filename)
+  })
 }
 
 function downloadStudentCredential(name: string, username: string, password: string) {
@@ -561,26 +562,6 @@ function DonutChart({ total, maleCount, femaleCount, otherCount = 0 }: { total: 
 }
 
 // ── Student avatar — DB photo > localStorage > gradient initials ──
-function StudentAvatar({ name, color, size = 28, photoUrl }: { name: string; color?: string; size?: number; photoUrl?: string | null }) {
-  const photo = photoUrl ?? (() => {
-    try { return localStorage.getItem(`teachscript_avatar_${name.replace(/\s+/g, "_")}`) }
-    catch { return null }
-  })()
-  const initials = name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()
-  const bg = color ? `linear-gradient(135deg,${color},${color}bb)` : "linear-gradient(135deg,#534AB7,#7970D6)"
-  return (
-    <div
-      className="rounded-full flex items-center justify-center overflow-hidden flex-shrink-0"
-      style={{ width: size, height: size, background: photo ? "transparent" : bg }}
-    >
-      {photo
-        ? <img src={photo} alt={name} className="w-full h-full object-cover" />
-        : <span className="text-white font-bold" style={{ fontSize: size * 0.36 }}>{initials}</span>
-      }
-    </div>
-  )
-}
-
 // ─── Timetable view component ─────────────────────────────────────────────────
 
 const TT_DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
@@ -1177,6 +1158,25 @@ export function AdminDashboard() {
   const [editSubjects, setEditSubjects] = useState<string[]>([])
   const [editClassLoading, setEditClassLoading] = useState(false)
   const [editClassErr, setEditClassErr] = useState("")
+  const [editYearStart, setEditYearStart] = useState("")
+  const [editYearStartReason, setEditYearStartReason] = useState("")
+  const [yearStartError, setYearStartError] = useState<string | null>(null)
+  const [yearStartConfirmOpen, setYearStartConfirmOpen] = useState(false)
+  // Saved-attendance preview shown inside the confirmation (only when a class that already has a date changes it)
+  const [yearStartPreviewLoading, setYearStartPreviewLoading] = useState(false)
+  const [yearStartPreview, setYearStartPreview] = useState<YearStartPreview | null>(null)
+  const [yearStartCheckFailed, setYearStartCheckFailed] = useState(false)
+  const yearStartPreviewToken = useRef(0)
+
+  // Set the school year start for many classes at once
+  const [showBulkYearStart, setShowBulkYearStart] = useState(false)
+  const [bulkYsDate, setBulkYsDate] = useState("")
+  const [bulkYsIncludeDated, setBulkYsIncludeDated] = useState(false)
+  const [bulkYsReason, setBulkYsReason] = useState("")
+  const [bulkYsLoading, setBulkYsLoading] = useState(false)
+  const [bulkYsError, setBulkYsError] = useState<string | null>(null)
+  const [bulkYsOutcome, setBulkYsOutcome] = useState<BulkYearStartOutcome | null>(null)
+  const [bulkYsFailedIds, setBulkYsFailedIds] = useState<string[]>([])
 
   // Timetable state
   const [timetableClassId, setTimetableClassId] = useState("")
@@ -1291,7 +1291,7 @@ export function AdminDashboard() {
   // Certificates — tab + class picker
   const [certTab, setCertTab] = useState<"certs" | "settings">("certs")
   const [certClassId, setCertClassId] = useState("")
-  const [certModules, setCertModules] = useState<Array<{ module_id: string; module_title: string; subject: string; total_items: number; certificates: AdminCertificate[] }>>([])
+  const [certModules, setCertModules] = useState<Array<{ module_id: string | null; module_title: string; subject: string; total_items: number; certificates: AdminCertificate[] }>>([])
   const [certCustomCerts, setCertCustomCerts] = useState<AdminCertificate[]>([])
   const [certModulesLoading, setCertModulesLoading] = useState(false)
   // Certificates — issue modal
@@ -1304,14 +1304,15 @@ export function AdminDashboard() {
   const [certClassStudents, setCertClassStudents] = useState<Array<{ id: string; name: string }>>([])
   const [certSelectedIds, setCertSelectedIds] = useState<Set<string>>(new Set())
   // Certificates — per-cert actions
-  const [certRevoking, setCertRevoking] = useState<string | null>(null)
+  const [certRevokeReason, setCertRevokeReason] = useState("")
+  const [certRevokeCount, setCertRevokeCount] = useState(0)
+  const [certActionError, setCertActionError] = useState("")
   const [certDeleteConfirm, setCertDeleteConfirm] = useState<{ certId: string; studentName: string; moduleTitle: string } | null>(null)
   const [certModuleDeleting, setCertModuleDeleting] = useState<string | null>(null)
   // Certificates — bulk actions on custom certs
   const [certBulkIds, setCertBulkIds] = useState<Set<string>>(new Set())
   const [certBulkDeleting, setCertBulkDeleting] = useState(false)
   const [certBulkConfirm, setCertBulkConfirm] = useState(false)
-  const [certBulkLoading, setCertBulkLoading] = useState<string | null>(null)
   // Live Code / Reports
   const [challenges, setChallenges] = useState<ChallengeRow[]>([])
   const [challengesLoading, setChallengesLoading] = useState(false)
@@ -1320,21 +1321,31 @@ export function AdminDashboard() {
 
   // ── data loaders ─────────────────────────────────────────────────────────────
 
-  useEffect(() => {
-    loadOverview()
-    loadTeacherSessions("today")
-    loadStudentAttendance()
-  }, [])
+  // Each list is loaded when a section that shows it opens, and not again for a minute
+  // while the admin moves between sections. Add/edit/remove actions reload explicitly.
+  const loadedAtRef = useRef<Record<string, number>>({})
+  function loadOnce(key: string, load: () => void, maxAgeMs = 60_000) {
+    const at = loadedAtRef.current[key]
+    if (at && Date.now() - at < maxAgeMs) return
+    loadedAtRef.current[key] = Date.now()
+    load()
+  }
+
+  // School name/stats feed the header and settings on every section
+  useEffect(() => { loadOverview() }, [])
 
   useEffect(() => {
-    if (view === "classes") { loadClasses(); setSelectedClassIds(new Set()) }
-    if (view === "teachers") { loadTeachers(); loadClasses() }
-    if (view === "students") { loadStudents(); loadClasses() }
-    if (view === "overview") { loadStudents(); loadClasses(); loadTeachers(); loadTeacherSessions("today"); loadStudentAttendance() }
-    if (view === "timetable") { loadClasses(); loadTeachers(); setTimetableClassId(""); setTimetableSlots([]); setPeriodTimes({}) }
+    if (view === "classes") { loadOnce("classes", loadClasses); setSelectedClassIds(new Set()) }
+    if (view === "teachers") { loadOnce("teachers", loadTeachers); loadOnce("classes", loadClasses) }
+    if (view === "students") { loadOnce("students", loadStudents); loadOnce("classes", loadClasses) }
+    if (view === "overview") {
+      loadOnce("students", loadStudents); loadOnce("classes", loadClasses); loadOnce("teachers", loadTeachers)
+      loadOnce("sessions-today", () => { loadTeacherSessions("today") }); loadOnce("attendance-today", () => { loadStudentAttendance() })
+    }
+    if (view === "timetable") { loadOnce("classes", loadClasses); loadOnce("teachers", loadTeachers); setTimetableClassId(""); setTimetableSlots([]); setPeriodTimes({}) }
     if (view === "notifications" && !notifsLoaded) { loadAdminNotifs() }
-    if (view === "certificates") { loadCertTemplate(); loadClasses() }
-    if (view === "reports") { loadChallenges(); loadClasses(); loadTeachers(); loadStudents() }
+    if (view === "certificates") { loadOnce("cert-template", loadCertTemplate); loadOnce("classes", loadClasses) }
+    if (view === "reports") { loadOnce("challenges", loadChallenges); loadOnce("classes", loadClasses); loadOnce("teachers", loadTeachers); loadOnce("students", loadStudents) }
   }, [view])
 
   // Auto-select first class on views that show a class dropdown with no default
@@ -1409,13 +1420,29 @@ export function AdminDashboard() {
     setStudentAttPeriod("month")
     setStudentAttCustomFrom("")
     setStudentAttCustomTo("")
-    if (!studentDetailMap[id]) {
-      setStudentDetailLoading(id)
-      const res = await getStudentDetail(id)
-      setStudentDetailLoading(null)
-      if (!("error" in res)) setStudentDetailMap(prev => ({ ...prev, [id]: res }))
-    }
+    if (!studentDetailMap[id]) await loadStudentDetail(id)
     void loadStudentAtt(id, "month")
+  }
+
+  async function loadStudentDetail(id: string) {
+    setStudentDetailLoading(id)
+    const res = await getStudentDetail(id)
+    setStudentDetailLoading(null)
+    if (!("error" in res)) {
+      // counted_from / counted_class_label say which class and date the attendance figure was counted from
+      const detail: StudentDetail = { ...res, counted_from: res.counted_from, counted_class_label: res.counted_class_label }
+      setStudentDetailMap(prev => ({ ...prev, [id]: detail }))
+    }
+  }
+
+  // After a move, the open row's class history is stale — forget it so it is fetched fresh next time the row opens
+  function dropStudentDetails(ids: string[]) {
+    setStudentDetailMap(prev => {
+      const next = { ...prev }
+      for (const id of ids) delete next[id]
+      return next
+    })
+    setExpandedStudentId(cur => (cur && ids.includes(cur) ? null : cur))
   }
 
   function handleDownloadCompliance() {
@@ -1612,7 +1639,10 @@ export function AdminDashboard() {
     setCertLogoRemoving(false)
   }
 
+  // Only the most recent class request may update the screen (fast class switching)
+  const certClassRequestRef = useRef(0)
   function loadCertClass(classId: string) {
+    const requestNo = ++certClassRequestRef.current
     setCertClassId(classId)
     setCertModulesLoading(true)
     setCertCustomCerts([])
@@ -1623,8 +1653,10 @@ export function AdminDashboard() {
       getCertsByClass(classId),
       getClassStudents(classId),
     ]).then(([certsRes, studentsRes]) => {
+      if (requestNo !== certClassRequestRef.current) return
       setCertModulesLoading(false)
-      if (!("error" in certsRes)) {
+      if ("error" in certsRes) { setCertModules([]); setCertCustomCerts([]); setCertActionError(certsRes.error) }
+      else {
         setCertModules(certsRes.modules)
         setCertCustomCerts(certsRes.custom_certificates ?? [])
       }
@@ -1636,6 +1668,7 @@ export function AdminDashboard() {
 
   async function handleIssueCerts() {
     if (!certClassId || certSelectedIds.size === 0 || !certIssueTitle.trim()) return
+    if (!certIssueTemplate) { setCertIssueError("Please choose a certificate type."); return }
     setCertIssueLoading(true)
     setCertIssueError("")
     const res = await issueCustomCertificate({
@@ -1643,12 +1676,11 @@ export function AdminDashboard() {
       student_ids: Array.from(certSelectedIds),
       custom_title: certIssueTitle.trim(),
       custom_reason: certIssueReason.trim() || undefined,
-      cert_template: certIssueTemplate ?? undefined,
+      cert_template: certIssueTemplate,
     })
     setCertIssueLoading(false)
     if ("error" in res) { setCertIssueError(res.error || "Failed to issue certificate. Please try again."); return }
-    const newCerts = (res as { created: number; certificates: AdminCertificate[] }).certificates
-    setCertCustomCerts(prev => [...prev, ...newCerts])
+    setCertCustomCerts(prev => [...prev, ...res.certificates])
     setCertIssueOpen(false)
     setCertIssueTitle("")
     setCertIssueReason("")
@@ -1656,50 +1688,43 @@ export function AdminDashboard() {
     setCertSelectedIds(new Set())
   }
 
-  async function handleRevokeCert(certId: string) {
-    if (!confirm("Revoke this custom certificate? This cannot be undone.")) return
-    setCertRevoking(certId)
-    const res = await revokeCertificate(certId)
-    setCertRevoking(null)
-    if (!("error" in res)) {
-      setCertCustomCerts(prev => prev.filter(c => c._id !== certId))
-    }
+  // A revoked certificate stays in every list, shown as "Revoked" (it is never deleted)
+  function markCertsRevoked(ids: Set<string>, reason: string) {
+    if (ids.size > 0) setCertRevokeCount(n => n + 1)
+    const revokedAt = new Date().toISOString()
+    const mark = (c: AdminCertificate): AdminCertificate =>
+      ids.has(c._id) ? { ...c, status: "revoked", revoked_at: revokedAt, revoke_reason: reason } : c
+    setCertModules(prev => prev.map(mod => ({ ...mod, certificates: mod.certificates.map(mark) })))
+    setCertCustomCerts(prev => prev.map(mark))
   }
 
-  async function handleBulkDeleteCerts() {
+  async function handleBulkRevokeCerts() {
     if (certBulkIds.size === 0) return
     setCertBulkDeleting(true)
+    setCertActionError("")
+    const reason = certRevokeReason.trim()
     const ids = Array.from(certBulkIds)
-    const results = await Promise.allSettled(ids.map(id => revokeCertificate(id)))
-    const deletedIds = new Set(
-      ids.filter((_, i) => results[i].status === "fulfilled" && !("error" in (results[i] as PromiseFulfilledResult<{ success: boolean } | { error: string }>).value))
-    )
-    setCertCustomCerts(prev => prev.filter(c => !deletedIds.has(c._id)))
+    const results = await Promise.all(ids.map(id => revokeCertificate(id, reason)))
+    const revoked = new Set(ids.filter((_, i) => !("error" in results[i])))
+    markCertsRevoked(revoked, reason)
+    if (revoked.size < ids.length) setCertActionError(`${ids.length - revoked.size} certificate(s) could not be revoked. Please try again.`)
     setCertBulkIds(new Set())
     setCertBulkDeleting(false)
     setCertBulkConfirm(false)
+    setCertRevokeReason("")
   }
 
-  async function handleDeleteModuleCert() {
+  async function handleConfirmRevoke() {
     if (!certDeleteConfirm) return
-    setCertModuleDeleting(certDeleteConfirm.certId)
-    const res = await deleteCert(certDeleteConfirm.certId)
+    const { certId } = certDeleteConfirm
+    const reason = certRevokeReason.trim()
+    setCertModuleDeleting(certId)
+    const res = await revokeCertificate(certId, reason)
     setCertModuleDeleting(null)
-    const confirmed = certDeleteConfirm
+    if ("error" in res) { setCertActionError(res.error); return }
     setCertDeleteConfirm(null)
-    if (!("error" in res)) {
-      setCertModules(prev => prev.map(mod => ({
-        ...mod,
-        certificates: mod.certificates.filter(c => c._id !== confirmed.certId),
-      })))
-    }
-  }
-
-  async function handleBulkDownload(moduleId: string) {
-    if (!certClassId) return
-    setCertBulkLoading(moduleId)
-    bulkDownloadCerts(certClassId, moduleId)
-    setTimeout(() => setCertBulkLoading(null), 5000)
+    setCertRevokeReason("")
+    markCertsRevoked(new Set([certId]), reason)
   }
 
   // ── handlers ──────────────────────────────────────────────────────────────────
@@ -1717,15 +1742,168 @@ export function AdminDashboard() {
     setStats(s => ({ ...s, classes: s.classes + 1 }))
   }
 
-  async function handleEditClass(e: React.FormEvent) {
-    e.preventDefault()
+  // Opening (or closing) the Edit class form always starts with a clean school-year-start state
+  function openEditClass(c: ClassRow | null) {
+    yearStartPreviewToken.current += 1
+    setEditClass(c)
+    // A class with no saved date starts with an empty box, so only a date the admin picks is saved
+    setEditYearStart(c ? (classStartDate(c) ?? "") : "")
+    setEditYearStartReason("")
+    setYearStartError(null)
+    setEditClassErr("")
+    setYearStartConfirmOpen(false)
+    setYearStartPreviewLoading(false)
+    setYearStartPreview(null)
+    setYearStartCheckFailed(false)
+  }
+
+  function yearStartChanged() {
+    return !!editClass && editYearStart !== "" && editYearStart !== (classStartDate(editClass) ?? "")
+  }
+
+  // Asks the server what the new date would do to saved attendance sheets (writes nothing), then opens the confirmation
+  async function checkYearStartPreview() {
     if (!editClass) return
-    setEditClassErr(""); setEditClassLoading(true)
-    const res = await updateClass(editClass.id, { name: editClassName || undefined, subjects: editSubjects })
+    const token = ++yearStartPreviewToken.current
+    setYearStartError(null); setYearStartCheckFailed(false); setYearStartPreview(null)
+    setYearStartConfirmOpen(true); setYearStartPreviewLoading(true)
+    const res = await getYearStartPreview(editClass.id, editYearStart)
+    if (token !== yearStartPreviewToken.current) return
+    setYearStartPreviewLoading(false)
+    if ("error" in res) {
+      // Back to the form: a refused date shows the server's sentence, anything else offers "Try again"
+      setYearStartConfirmOpen(false)
+      if (res.code) setYearStartError(res.error)
+      else setYearStartCheckFailed(true)
+      return
+    }
+    setYearStartPreview(res)
+  }
+
+  function handleEditClass(e: React.FormEvent) {
+    e.preventDefault()
+    if (!editClass || editClassLoading || yearStartPreviewLoading) return
+    const hasSavedDate = classStartDate(editClass) !== null
+    // A saved date cannot be removed by emptying the box
+    if (hasSavedDate && editYearStart === "") { setYearStartError(YEAR_START_CHOOSE_DATE); return }
+    // Changing a date that is already saved is confirmed first (with a preview of the saved sheets)
+    if (yearStartChanged() && hasSavedDate) {
+      void checkYearStartPreview()
+      return
+    }
+    // A first date in the future keeps teachers out until that day, so it is confirmed too (no preview: nothing is saved yet)
+    if (yearStartChanged() && editYearStart > istToday()) {
+      yearStartPreviewToken.current += 1
+      setYearStartError(null); setYearStartCheckFailed(false); setYearStartPreview(null)
+      setYearStartPreviewLoading(false); setYearStartConfirmOpen(true)
+      return
+    }
+    void saveEditedClass()
+  }
+
+  // "Keep <old date>" in the confirmation: back to the form with the old date
+  function cancelYearStartChange() {
+    yearStartPreviewToken.current += 1
+    setEditYearStart(editClass ? (classStartDate(editClass) ?? "") : "")
+    setYearStartConfirmOpen(false)
+    setYearStartPreviewLoading(false)
+    setYearStartPreview(null)
+    setYearStartError(null)
+  }
+
+  async function saveEditedClass() {
+    if (!editClass) return
+    const dateChanged = yearStartChanged()
+    const reason = editYearStartReason.trim()
+    setEditClassErr(""); setYearStartError(null); setEditClassLoading(true)
+    const res = await updateClass(editClass.id, {
+      name: editClassName || undefined,
+      subjects: editSubjects,
+      ...(dateChanged ? { year_start: editYearStart, expected_current: classStartDate(editClass) } : {}),
+      ...(dateChanged && reason ? { reason } : {}),
+    })
     setEditClassLoading(false)
-    if ("error" in res) { setEditClassErr(res.error || "Failed to save changes. Please try again."); return }
-    setClasses(prev => prev.map(c => c.id === editClass.id ? { ...c, name: res.name, subjects: res.subjects } : c))
-    setEditClass(null)
+    setYearStartConfirmOpen(false)
+    if ("error" in res) {
+      if (res.code === "conflict" && res.year_start_effective) {
+        // Someone else changed the date: show it, keep the typed reason, and use it as the new starting point.
+        // The saved date comes from the server's year_start (null = none saved); the effective date may be only a default.
+        const savedStart = res.year_start ?? null
+        setYearStartError(savedStart
+          ? `Someone else just changed this date to ${formatYmdForDisplay(savedStart)}. Nothing was saved. Check the new date and try again.`
+          : "Someone else just changed this class. Nothing was saved. Check the class and try again.")
+        setEditClass({ ...editClass, year_start: savedStart, year_start_effective: res.year_start_effective, has_start_date: savedStart !== null })
+        setEditYearStart(savedStart ?? "")
+        void loadClasses()
+      } else if (dateChanged) {
+        setYearStartError(res.error || "Failed to save the school year start. Please try again.")
+      } else {
+        setEditClassErr(res.error || "Failed to save changes. Please try again.")
+      }
+      return
+    }
+    setClasses(prev => prev.map(c => c.id === editClass.id
+      ? { ...c, name: res.name, subjects: res.subjects, year_start: res.year_start, year_start_effective: res.year_start_effective, has_start_date: res.year_start !== null }
+      : c))
+    if (dateChanged) void loadClasses()
+    openEditClass(null)
+  }
+
+  // ── Set the school year start for many classes at once ──
+  // `ids` (when given) become the ticked classes, e.g. "Set dates" ticks exactly the classes without a date
+  function openBulkYearStart(ids?: string[]) {
+    if (ids) setSelectedClassIds(new Set(ids))
+    setBulkYsDate(""); setBulkYsIncludeDated(false); setBulkYsReason("")
+    setBulkYsError(null); setBulkYsOutcome(null); setBulkYsFailedIds([])
+    setShowBulkYearStart(true)
+  }
+
+  function closeBulkYearStart() {
+    if (bulkYsLoading) return
+    if (bulkYsOutcome && bulkYsOutcome.updated > 0) setSelectedClassIds(new Set())
+    setShowBulkYearStart(false)
+  }
+
+  // `onlyIds` is the "Retry": only the classes that could not be saved are sent again
+  async function sendBulkYearStart(onlyIds?: string[]) {
+    if (bulkYsLoading || !bulkYsDate) return
+    const wanted = classes.filter(c => (onlyIds ? onlyIds.includes(c.id) : selectedClassIds.has(c.id)))
+    if (wanted.length === 0) return
+    if (wanted.length > 200) { setBulkYsError("You can set at most 200 classes at a time. Please untick some classes."); return }
+    const reason = bulkYsReason.trim()
+    setBulkYsLoading(true); setBulkYsError(null)
+    const res = await bulkSetYearStart({
+      year_start: bulkYsDate,
+      classes: wanted.map(c => ({ id: c.id, expected_current: classStartDate(c) })),
+      ...(bulkYsIncludeDated ? { include_dated: true } : {}),
+      ...(reason ? { reason } : {}),
+    })
+    if ("error" in res) {
+      // A timeout or network error may still have saved some classes: reload so a retry sends fresh expected dates
+      await loadClasses()
+      setBulkYsLoading(false)
+      setBulkYsError(res.error || "Could not save the start dates. Please try again.")
+      return
+    }
+    let updated = 0, leftAsTheyWere = 0, notFound = 0
+    const failedIds: string[] = []
+    for (const r of res.results) {
+      if (r.status === "saved" || r.status === "unchanged") updated += 1
+      else if (r.status === "error") failedIds.push(r.id)
+      else if (r.status === "not_found") notFound += 1
+      else leftAsTheyWere += 1
+    }
+    await loadClasses()
+    // A retry adds to what the first attempt already did
+    const before = onlyIds ? bulkYsOutcome : null
+    setBulkYsOutcome({
+      updated: updated + (before?.updated ?? 0),
+      leftAsTheyWere: leftAsTheyWere + (before?.leftAsTheyWere ?? 0),
+      notFound: notFound + (before?.notFound ?? 0),
+      failed: failedIds.length,
+    })
+    setBulkYsFailedIds(failedIds)
+    setBulkYsLoading(false)
   }
 
   async function handleDeleteClass() {
@@ -1818,6 +1996,7 @@ export function AdminDashboard() {
       name: res.name, email: res.email, phone: res.phone,
       gender: res.gender, class_id: res.class_id, class_label: res.class_label,
     } : s))
+    dropStudentDetails([editStudent.id])
     setEditStudent(null)
   }
 
@@ -1843,6 +2022,7 @@ export function AdminDashboard() {
             ? { ...s, class_id: res.class_id, class_label: res.class_label }
             : s
         ))
+        dropStudentDetails(ids)
       }
     } else if (action === "gender" && bulkActionGender) {
       // single request — updateMany on backend
@@ -1886,19 +2066,21 @@ export function AdminDashboard() {
   }
 
   async function handleTeacherBulkAction(action: "class" | "delete") {
-    if (selectedTeacherIds.size === 0) return
+    // Only teachers the current search shows — never someone hidden by the search
+    const ids = filteredTeachers.filter(t => selectedTeacherIds.has(t.id)).map(t => t.id)
+    if (ids.length === 0) return
+    const idSet = new Set(ids)
     setTeacherBulkActionLoading(true)
-    const ids = Array.from(selectedTeacherIds)
     if (action === "delete") {
       await bulkDeleteUsers(ids)
-      setTeachers(prev => prev.filter(t => !selectedTeacherIds.has(t.id)))
+      setTeachers(prev => prev.filter(t => !idSet.has(t.id)))
       setStats(s => ({ ...s, teachers: Math.max(0, s.teachers - ids.length) }))
     } else if (action === "class" && teacherBulkClass) {
       // single request — bulk assign on backend
       const res = await bulkAssignTeachersToClass(ids, teacherBulkClass)
       if (!("error" in res)) {
         setTeachers(prev => prev.map(t =>
-          selectedTeacherIds.has(t.id) ? { ...t, class_label: res.class_label } : t
+          idSet.has(t.id) ? { ...t, class_label: res.class_label } : t
         ))
       }
     }
@@ -2140,7 +2322,7 @@ export function AdminDashboard() {
           newSubjects={newSubjects}
           setNewSubjects={setNewSubjects}
           editClass={editClass}
-          setEditClass={setEditClass}
+          setEditClass={openEditClass}
           editClassName={editClassName}
           setEditClassName={setEditClassName}
           editSubjectInput={editSubjectInput}
@@ -2150,6 +2332,33 @@ export function AdminDashboard() {
           editClassErr={editClassErr}
           editClassLoading={editClassLoading}
           handleEditClass={handleEditClass}
+          editYearStart={editYearStart}
+          setEditYearStart={setEditYearStart}
+          editYearStartReason={editYearStartReason}
+          setEditYearStartReason={setEditYearStartReason}
+          yearStartError={yearStartError}
+          yearStartConfirmOpen={yearStartConfirmOpen}
+          yearStartPreviewLoading={yearStartPreviewLoading}
+          yearStartPreview={yearStartPreview}
+          yearStartCheckFailed={yearStartCheckFailed}
+          retryYearStartPreview={() => void checkYearStartPreview()}
+          confirmYearStartChange={() => void saveEditedClass()}
+          cancelYearStartChange={cancelYearStartChange}
+          showBulkYearStart={showBulkYearStart}
+          openBulkYearStart={openBulkYearStart}
+          closeBulkYearStart={closeBulkYearStart}
+          bulkYsDate={bulkYsDate}
+          setBulkYsDate={setBulkYsDate}
+          bulkYsIncludeDated={bulkYsIncludeDated}
+          setBulkYsIncludeDated={setBulkYsIncludeDated}
+          bulkYsReason={bulkYsReason}
+          setBulkYsReason={setBulkYsReason}
+          bulkYsLoading={bulkYsLoading}
+          bulkYsError={bulkYsError}
+          bulkYsOutcome={bulkYsOutcome}
+          bulkYsFailedCount={bulkYsFailedIds.length}
+          submitBulkYearStart={() => void sendBulkYearStart()}
+          retryBulkYearStart={() => void sendBulkYearStart(bulkYsFailedIds)}
           confirmDeleteClass={confirmDeleteClass}
           setConfirmDeleteClass={setConfirmDeleteClass}
           handleDeleteClass={handleDeleteClass}
@@ -2244,6 +2453,7 @@ export function AdminDashboard() {
           studentDetailMap={studentDetailMap}
           studentDetailLoading={studentDetailLoading}
           handleToggleStudent={handleToggleStudent}
+          retryStudentDetail={id => void loadStudentDetail(id)}
           studentAttPeriod={studentAttPeriod}
           setStudentAttPeriod={setStudentAttPeriod}
           studentAttCache={studentAttCache}
@@ -2715,9 +2925,9 @@ export function AdminDashboard() {
           {certClassId && !certModulesLoading && (
             <div className="grid grid-cols-3 gap-3">
               {[
-                { label: "Total Issued", value: certModules.reduce((s, m) => s + m.certificates.length, 0) + certCustomCerts.length, color: "var(--ts-purple)" },
-                { label: "Special Certificates", value: certCustomCerts.length, color: "#F59E0B" },
-                { label: "Course Certificates", value: certModules.reduce((s, m) => s + m.certificates.length, 0), color: "var(--ts-blue)" },
+                { label: "Active Certificates", value: certModules.reduce((s, m) => s + m.certificates.filter(c => c.status !== "revoked").length, 0) + certCustomCerts.filter(c => c.status !== "revoked").length, color: "var(--ts-purple)" },
+                { label: "Special Certificates", value: certCustomCerts.filter(c => c.status !== "revoked").length, color: "#F59E0B" },
+                { label: "Course Certificates", value: certModules.reduce((s, m) => s + m.certificates.filter(c => c.status !== "revoked").length, 0), color: "var(--ts-blue)" },
               ].map(tile => (
                 <div key={tile.label} className="skillio-card p-4 flex flex-col gap-1">
                   <p className="text-2xl font-bold text-foreground">{tile.value}</p>
@@ -2737,62 +2947,90 @@ export function AdminDashboard() {
             />
           )}
 
+          {/* Who has completed — teacher/admin issues subject certificates on demand */}
+          {certClassId && (
+            <CertificateCompletionPanel classId={certClassId} refreshKey={certRevokeCount} onIssued={() => loadCertClass(certClassId)} />
+          )}
+
+          {certActionError && (
+            <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
+              <span className="text-xs text-destructive">{certActionError}</span>
+              <button type="button" className="text-muted-foreground hover:text-foreground cursor-pointer" onClick={() => setCertActionError("")} aria-label="Dismiss"><X className="w-3.5 h-3.5" /></button>
+            </div>
+          )}
+
           {/* Certificates list */}
           {certClassId && !certModulesLoading && (
             <>
               {/* Special / Custom Certificates */}
-              {certCustomCerts.length > 0 && (
+              {certCustomCerts.length > 0 && (() => {
+                const activeCustom = certCustomCerts.filter(c => c.status !== "revoked")
+                return (
                 <div className="skillio-card overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-3 bg-muted/30 border-b gap-2 flex-wrap">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <input
-                        type="checkbox"
-                        className="rounded cursor-pointer"
-                        checked={certBulkIds.size === certCustomCerts.length && certCustomCerts.length > 0}
-                        onChange={e => setCertBulkIds(e.target.checked ? new Set(certCustomCerts.map(c => c._id)) : new Set())}
-                      />
+                      {activeCustom.length > 0 && (
+                        <input
+                          type="checkbox"
+                          className="rounded cursor-pointer"
+                          aria-label="Select all active special certificates"
+                          checked={certBulkIds.size === activeCustom.length}
+                          onChange={e => setCertBulkIds(e.target.checked ? new Set(activeCustom.map(c => c._id)) : new Set())}
+                        />
+                      )}
                       <div>
                         <p className="text-xs font-bold text-foreground">Special Certificates</p>
-                        <p className="text-[11px] text-muted-foreground">{certCustomCerts.length} certificate{certCustomCerts.length !== 1 ? "s" : ""} issued</p>
+                        <p className="text-[11px] text-muted-foreground">{activeCustom.length} active{certCustomCerts.length > activeCustom.length ? ` · ${certCustomCerts.length - activeCustom.length} revoked` : ""}</p>
                       </div>
                     </div>
                     {certBulkIds.size > 0 && !certBulkConfirm && (
                       <Button size="sm" className="text-xs rounded-lg gap-1 h-7 text-white border-0 bg-destructive hover:bg-destructive/90"
-                        onClick={() => setCertBulkConfirm(true)}>
-                        <Trash2 className="w-3 h-3" />Delete {certBulkIds.size} selected
+                        onClick={() => { setCertRevokeReason(""); setCertBulkConfirm(true) }}>
+                        <Ban className="w-3 h-3" />Revoke {certBulkIds.size} selected
                       </Button>
                     )}
                   </div>
 
                   {certBulkConfirm && (
-                    <div className="flex items-center justify-between px-4 py-2.5 bg-destructive/5 border-b border-destructive/20 gap-2 flex-wrap">
+                    <div className="flex flex-col gap-2 px-4 py-2.5 bg-destructive/5 border-b border-destructive/20">
                       <p className="text-xs text-destructive font-medium">
-                        Delete {certBulkIds.size} certificate{certBulkIds.size !== 1 ? "s" : ""}? This cannot be undone.
+                        Revoke {certBulkIds.size} certificate{certBulkIds.size !== 1 ? "s" : ""}? They stay on record marked "Revoked" and can no longer be downloaded.
                       </p>
-                      <div className="flex gap-2">
+                      <Input className="h-8 text-xs" maxLength={300} placeholder="Reason (optional), e.g. issued to the wrong student"
+                        aria-label="Reason for revoking" value={certRevokeReason} onChange={e => setCertRevokeReason(e.target.value)} />
+                      <div className="flex gap-2 justify-end">
                         <Button size="sm" variant="outline" className="text-xs rounded-lg h-7"
                           disabled={certBulkDeleting}
                           onClick={() => setCertBulkConfirm(false)}>Cancel</Button>
                         <Button size="sm" className="text-xs rounded-lg h-7 text-white border-0 bg-destructive hover:bg-destructive/90"
                           disabled={certBulkDeleting}
-                          onClick={handleBulkDeleteCerts}>
-                          {certBulkDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Deleting…</> : "Confirm Delete"}
+                          onClick={handleBulkRevokeCerts}>
+                          {certBulkDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Revoking…</> : "Confirm Revoke"}
                         </Button>
                       </div>
                     </div>
                   )}
 
                   <div className="divide-y divide-border">
-                    {certCustomCerts.map(cert => (
+                    {certCustomCerts.map(cert => cert.status === "revoked" ? (
+                      <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2">
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium text-foreground truncate">{cert.student_name}</p>
+                          <p className="text-[10px] text-muted-foreground truncate">{cert.custom_title} — revoked{cert.revoked_at ? ` ${new Date(cert.revoked_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}` : ""}{cert.revoke_reason ? `: ${cert.revoke_reason}` : ""}</p>
+                        </div>
+                        <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-muted text-muted-foreground flex-shrink-0">Revoked</span>
+                      </div>
+                    ) : (
                       <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2 hover:bg-muted/20 transition-colors">
                         <div className="flex items-center gap-2.5 min-w-0">
                           <input
                             type="checkbox"
                             className="rounded cursor-pointer flex-shrink-0"
+                            aria-label={`Select ${cert.student_name}'s certificate`}
                             checked={certBulkIds.has(cert._id)}
                             onChange={e => setCertBulkIds(prev => {
                               const next = new Set(prev)
-                              e.target.checked ? next.add(cert._id) : next.delete(cert._id)
+                              if (e.target.checked) next.add(cert._id); else next.delete(cert._id)
                               return next
                             })}
                           />
@@ -2809,23 +3047,24 @@ export function AdminDashboard() {
                             onClick={() => viewCertPDF(cert._id)}>
                             <Eye className="w-3 h-3" />View
                           </Button>
-                          <Button size="sm" variant="outline" className="text-xs rounded-lg gap-1 h-7"
+                          <Button size="sm" variant="outline" className="text-xs rounded-lg gap-1 h-7" aria-label={`Download ${cert.student_name}'s certificate`}
                             onClick={() => downloadCertPDF(cert._id, cert.student_name)}>
                             <Download className="w-3 h-3" />
                           </Button>
                           <Button size="sm" variant="outline" className="text-xs rounded-lg gap-1 h-7 text-destructive hover:text-destructive border-destructive/30"
-                            disabled={certRevoking === cert._id}
-                            onClick={() => handleRevokeCert(cert._id)}>
-                            {certRevoking === cert._id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                            aria-label={`Revoke ${cert.student_name}'s certificate`}
+                            onClick={() => { setCertRevokeReason(""); setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: cert.custom_title }) }}>
+                            <Ban className="w-3 h-3" />
                           </Button>
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
-              )}
+                )
+              })()}
 
-              {/* Course Certificates — flat list */}
+              {/* Course / subject certificates — flat list */}
               {(() => {
                 const allModuleCerts = certModules.flatMap(mod =>
                   mod.certificates.map(cert => ({ ...cert, module_title: mod.module_title, subject: mod.subject }))
@@ -2835,19 +3074,28 @@ export function AdminDashboard() {
                     <Empty
                       icon={<Award className="w-6 h-6" />}
                       title="No certificates yet"
-                      body="No certificates have been issued in this class. Students earn certificates by completing modules, or you can issue special awards manually."
+                      body="No certificates have been issued in this class. Use “Who has completed a subject” above to issue course certificates, or issue a special award."
                     />
                   )
                 }
                 if (allModuleCerts.length === 0) return null
+                const activeCount = allModuleCerts.filter(c => c.status !== "revoked").length
                 return (
                   <div className="skillio-card overflow-hidden">
                     <div className="px-4 py-3 bg-muted/30 border-b">
                       <p className="text-xs font-bold text-foreground">Course Certificates</p>
-                      <p className="text-[11px] text-muted-foreground">{allModuleCerts.length} certificate{allModuleCerts.length !== 1 ? "s" : ""} issued</p>
+                      <p className="text-[11px] text-muted-foreground">{activeCount} active{allModuleCerts.length > activeCount ? ` · ${allModuleCerts.length - activeCount} revoked` : ""}</p>
                     </div>
                     <div className="divide-y divide-border">
-                      {allModuleCerts.map(cert => (
+                      {allModuleCerts.map(cert => cert.status === "revoked" ? (
+                        <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium text-foreground truncate">{cert.student_name}</p>
+                            <p className="text-[10px] text-muted-foreground truncate">{cert.module_title} · {cert.subject}{cert.revoke_reason ? ` — revoked: ${cert.revoke_reason}` : ""}</p>
+                          </div>
+                          <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-muted text-muted-foreground flex-shrink-0">Revoked</span>
+                        </div>
+                      ) : (
                         <div key={cert._id} className="flex items-center justify-between px-4 py-2.5 gap-2 hover:bg-muted/20 transition-colors">
                           <div className="flex items-center gap-2.5 min-w-0">
                             <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
@@ -2870,13 +3118,13 @@ export function AdminDashboard() {
                               onClick={() => downloadCertPDF(cert._id, cert.student_name)}>
                               <Download className="w-3.5 h-3.5" />
                             </button>
-                            <button title="Delete certificate" aria-label={`Delete certificate for ${cert.student_name}`}
+                            <button title="Revoke certificate" aria-label={`Revoke certificate for ${cert.student_name}`}
                               disabled={certModuleDeleting === cert._id}
                               className="min-w-[44px] min-h-[44px] rounded-md flex items-center justify-center text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer disabled:opacity-40"
-                              onClick={() => setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: cert.module_title })}>
+                              onClick={() => { setCertRevokeReason(""); setCertDeleteConfirm({ certId: cert._id, studentName: cert.student_name, moduleTitle: cert.module_title }) }}>
                               {certModuleDeleting === cert._id
                                 ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                : <Trash2 className="w-3.5 h-3.5" />}
+                                : <Ban className="w-3.5 h-3.5" />}
                             </button>
                           </div>
                         </div>
@@ -2886,29 +3134,31 @@ export function AdminDashboard() {
                 )
               })()}
 
-              {/* Delete module cert confirmation dialog */}
+              {/* Revoke confirmation dialog */}
               {certDeleteConfirm && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-                  <div className="bg-background rounded-xl shadow-xl w-full max-w-sm p-5 flex flex-col gap-4">
+                  <div role="alertdialog" aria-modal="true" aria-labelledby="admin-cert-revoke-heading" className="bg-background rounded-xl shadow-xl w-full max-w-sm p-5 flex flex-col gap-4">
                     <div className="flex items-start gap-3">
                       <div className="w-9 h-9 rounded-full bg-destructive/10 flex items-center justify-center flex-shrink-0">
-                        <Trash2 className="w-4 h-4 text-destructive" />
+                        <Ban className="w-4 h-4 text-destructive" />
                       </div>
                       <div>
-                        <p className="text-sm font-bold text-foreground">Delete certificate?</p>
+                        <p id="admin-cert-revoke-heading" className="text-sm font-bold text-foreground">Revoke certificate?</p>
                         <p className="text-xs text-muted-foreground mt-1">
-                          This will remove <span className="font-semibold text-foreground">{certDeleteConfirm.studentName}</span>'s certificate for <span className="font-semibold text-foreground">"{certDeleteConfirm.moduleTitle}"</span>.
-                          They will be able to re-claim it by completing the module again.
+                          <span className="font-semibold text-foreground">{certDeleteConfirm.studentName}</span>'s certificate for <span className="font-semibold text-foreground">"{certDeleteConfirm.moduleTitle}"</span> will
+                          stay on record marked "Revoked" and can no longer be downloaded. It can be issued again later.
                         </p>
                       </div>
                     </div>
+                    <Input className="h-9 text-xs" maxLength={300} placeholder="Reason (optional), e.g. issued to the wrong student"
+                      autoFocus aria-label="Reason for revoking" value={certRevokeReason} onChange={e => setCertRevokeReason(e.target.value)} />
                     <div className="flex gap-2 justify-end">
                       <Button size="sm" variant="outline" className="text-xs rounded-lg"
                         onClick={() => setCertDeleteConfirm(null)}>Cancel</Button>
                       <Button size="sm" className="text-xs rounded-lg text-white border-0 bg-destructive hover:bg-destructive/90"
                         disabled={!!certModuleDeleting}
-                        onClick={handleDeleteModuleCert}>
-                        {certModuleDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Deleting…</> : "Delete"}
+                        onClick={handleConfirmRevoke}>
+                        {certModuleDeleting ? <><Loader2 className="w-3 h-3 animate-spin mr-1" />Revoking…</> : "Revoke"}
                       </Button>
                     </div>
                   </div>
@@ -3093,7 +3343,7 @@ export function AdminDashboard() {
                   <Button size="sm" variant="outline" className="text-xs rounded-lg"
                     onClick={() => { setCertIssueOpen(false); setCertIssueTemplate(null) }}>Cancel</Button>
                   <Button size="sm" style={{ background: "var(--ts-purple)", color: "white" }} className="text-xs rounded-lg gap-1"
-                    disabled={!certIssueTitle.trim() || certSelectedIds.size === 0 || certIssueLoading}
+                    disabled={!certIssueTitle.trim() || !certIssueTemplate || certSelectedIds.size === 0 || certIssueLoading}
                     onClick={handleIssueCerts}>
                     {certIssueLoading ? <><Loader2 className="w-3 h-3 animate-spin" />Issuing…</> : `Issue to ${certSelectedIds.size || 0} student${certSelectedIds.size !== 1 ? "s" : ""}`}
                   </Button>

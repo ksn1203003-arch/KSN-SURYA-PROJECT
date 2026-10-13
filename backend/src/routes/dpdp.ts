@@ -5,6 +5,9 @@ import { DataDeletionRequest } from "../models/DataDeletionRequest.js"
 import { User } from "../models/User.js"
 import { AuditLog } from "../models/AuditLog.js"
 import { logger } from "../lib/logger.js"
+import { deleteStoredReportCards } from "../services/reportCardPdf.js"
+import { StudentEnrollment } from "../models/StudentEnrollment.js"
+import { withRetry } from "../lib/retry.js"
 
 const router = Router()
 router.use(requireAuth)
@@ -80,8 +83,18 @@ router.patch("/deletion-requests/:id", async (req: AuthRequest, res: Response) =
   request.reviewed_by = req.userId as unknown as import("mongoose").Types.ObjectId
   await request.save()
 
+  let historyErased = true
   if (action === "approve") {
     await User.findByIdAndUpdate(request.user_id, { is_active: false })
+    await deleteStoredReportCards(String(request.user_id)).catch(err =>
+      logger.error({ err }, "[dpdp] could not remove stored report cards"))
+    // The student's class history goes with the rest of his data. A failure is retried, then recorded in the audit entry.
+    try {
+      await withRetry(() => StudentEnrollment.deleteMany({ student_id: request.user_id, school_id: admin.school_id }).exec(), 3, 200)
+    } catch (err) {
+      historyErased = false
+      logger.error({ err }, "[dpdp] could not remove class history")
+    }
   }
 
   // Write to AuditLog — DPDP Act 2023 requires a record of every approve/reject decision
@@ -94,7 +107,7 @@ router.patch("/deletion-requests/:id", async (req: AuthRequest, res: Response) =
       resource_type: "DataDeletionRequest",
       resource_id:   request._id.toString(),
       before:        { status: "pending" },
-      after:         { status: request.status, user_id: request.user_id.toString(), user_email: request.user_email },
+      after:         { status: request.status, user_id: request.user_id.toString(), user_email: request.user_email, ...(action === "approve" ? { history_erased: historyErased } : {}) },
       ip:            (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ?? req.socket?.remoteAddress ?? null,
     })
   } catch (auditErr) {

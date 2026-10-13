@@ -59,9 +59,11 @@ export async function moveToDLQ(queueName: string, jobId: string | undefined, da
 
 export interface PptxJobData {
   moduleId:    string
-  itemId:      string
+  itemId:      string   // must equal the _id saved on the module item
   gridfsId:    string   // ObjectId string of the original PPTX file in GridFS
   fileName:    string
+  schoolId:    string   // stamped on the converted PDF so files.ts serves it (fail-closed boundary)
+  classId:     string
 }
 
 export function getPptxQueue(): Queue | null {
@@ -99,15 +101,15 @@ export interface PdfJobData {
   html:      string
   /** Filename to set in the Content-Disposition header */
   fileName:  string
-  /** userId who requested this PDF — used to scope the FileToken */
+  /** userId who requested this PDF — stored with the PDF as the requester */
   userId:    string
+  /** Extra fields stored with the PDF so it can be found and reused later (e.g. report-card cache keys) */
+  metadata?: Record<string, string>
 }
 
 export interface PdfJobResult {
   /** ObjectId string of the GridFS file containing the rendered PDF */
   gridfsId: string
-  /** Short-lived FileToken string for the client to download with */
-  token:    string
 }
 
 export function getPdfQueue(): Queue | null {
@@ -120,8 +122,9 @@ export function getPdfQueue(): Queue | null {
       defaultJobOptions: {
         attempts: 2,
         backoff: { type: "exponential", delay: 3000 },
-        removeOnComplete: { count: 200 },
-        removeOnFail:     { count: 100 },
+        // Job data holds a child's report card (name, marks, attendance): never keep it after the job
+        removeOnComplete: true,
+        removeOnFail:     true,
       },
     })
   }

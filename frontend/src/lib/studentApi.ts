@@ -17,7 +17,7 @@ async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> 
       headers: { "Content-Type": "application/json", "X-Request-ID": requestId, ...(options.headers ?? {}) },
     })
     const data = await res.json()
-    if (!res.ok) return { error: (data as { error?: string }).error ?? `Request failed (${res.status})`, requestId } as T
+    if (!res.ok) return { error: (data as { error?: string }).error ?? `Request failed (${res.status})`, requestId, status: res.status } as T
     return data as T
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") return { error: "Request timed out. Please try again.", requestId } as T
@@ -37,12 +37,16 @@ export interface DashboardSummary {
   quizzes_taken:     number
   days_present:      number
   days_total:        number
+  days_recorded:     number
   attendance_rate:   number
   streak_days:       number
   module_progress:   { subject: string; completed: number; total: number }[]
   weekly_activity:   { date: string; day: string; minutes: number; school_day_minutes: number }[]
   continue_learning: { module_id: string; module_title: string; subject: string; completed: number; total: number }[]
   upcoming_events:   AppNotificationEvent[]
+  // Attendance is counted from the class's school-year start (YYYY-MM-DD); null = every recorded sheet
+  counted_from?:        string | null
+  counted_class_label?: string | null
 }
 
 export interface AppNotificationEvent {
@@ -117,12 +121,34 @@ export interface StudentCertificate {
   type:          "module" | "custom"
   custom_title:  string
   custom_reason: string
+  cert_template?: CertTemplateKey | null
+  // Older certificates have no status — treat a missing status as "active"
+  status?:        "active" | "revoked"
+  revoked_at?:    string | null
+  revoke_reason?: string
 }
 
-export interface EligibleSubject {
-  subject:           string
-  modules_count:     number
-  total_items_count: number
+export type CertTemplateKey = "course_completion" | "academic_excellence" | "outstanding_achievement"
+
+export function isRevoked(cert: { status?: string }): boolean {
+  return cert.status === "revoked"
+}
+
+export interface SubjectCompletionStudent {
+  student_id:  string
+  name:        string
+  viewed:      number
+  total:       number
+  completed:   boolean
+  certificate: { id: string; status: "active" | "revoked"; issued_at: string; revoked_at: string | null } | null
+}
+
+export interface SubjectCompletion {
+  subject:       string
+  modules_count: number
+  total_items:   number
+  empty_modules: string[]
+  students:      SubjectCompletionStudent[]
 }
 
 export interface StudentQuest {
@@ -158,7 +184,7 @@ export interface MyTeacher {
   id:                string
   name:              string
   phone:             string | null
-  profile_photo_url: string | null
+  photo_url: string | null
   subjects:          string[]
 }
 
@@ -185,6 +211,8 @@ export interface AttendanceSummary {
 export async function getMyAttendance(): Promise<{
   summary: AttendanceSummary
   records: Array<{ date: string; period: number; subject: string; status: string }>
+  counted_from?:        string | null
+  counted_class_label?: string | null
 } | { error: string }> {
   return apiFetch("/api/student/attendance")
 }
@@ -193,6 +221,8 @@ export async function getMyAttendance(): Promise<{
 // from / to must be YYYY-MM-DD strings
 export async function getAttendanceRange(from: string, to: string): Promise<{
   result: AttendancePeriodSummary
+  counted_from?:        string | null
+  counted_class_label?: string | null
 } | { error: string }> {
   return apiFetch(`/api/student/attendance/range?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
 }
@@ -318,17 +348,6 @@ export async function getMyCertificates(): Promise<{ certificates: StudentCertif
   return apiFetch("/api/student-certificates/mine")
 }
 
-export async function claimCertificate(subject: string): Promise<{ certificate: StudentCertificate } | { error: string }> {
-  return apiFetch("/api/student-certificates/claim", {
-    method: "POST",
-    body: JSON.stringify({ subject }),
-  })
-}
-
-export async function getEligibleCertificates(): Promise<{ eligible: EligibleSubject[] } | { error: string }> {
-  return apiFetch("/api/student-certificates/eligible")
-}
-
 // Download student's own cert PDF — triggers browser download
 export function downloadStudentCertPDF(certId: string, studentName: string): void {
   const BACKEND = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:4000"
@@ -389,7 +408,7 @@ export async function removeCertLogo(): Promise<{ success: boolean } | { error: 
 
 export async function getCertsByClass(classId: string): Promise<{
   modules: Array<{
-    module_id: string; module_title: string; subject: string; total_items: number
+    module_id: string | null; module_title: string; subject: string; total_items: number
     certificates: StudentCertificate[]
   }>
   custom_certificates: StudentCertificate[]
@@ -415,25 +434,37 @@ export function viewCertPDF(certId: string): void {
   window.open(`${BACKEND}/api/certificates/download/${certId}?inline=1`, "_blank", "noopener,noreferrer")
 }
 
-// Teacher issues custom certificates to one or more students
+// Teacher issues a special (custom) certificate to one or more students
 export async function issueCertificates(data: {
   class_id: string
   student_ids: string[]
   custom_title: string
   custom_reason?: string
-  cert_template?: "course_completion" | "academic_excellence" | "outstanding_achievement"
+  cert_template: CertTemplateKey
 }): Promise<{ created: number; certificates: StudentCertificate[] } | { error: string }> {
   return apiFetch("/api/certificates/custom-issue", { method: "POST", body: JSON.stringify(data) })
 }
 
-// Teacher revokes a custom certificate
-export async function revokeCustomCert(certId: string): Promise<{ success: boolean } | { error: string }> {
-  return apiFetch(`/api/certificates/${certId}`, { method: "DELETE" })
+// Teacher revokes a certificate. It is kept and marked "Revoked" — never deleted.
+export async function revokeCert(certId: string, reason: string): Promise<{ success: boolean; revoked_at: string } | { error: string }> {
+  return apiFetch(`/api/certificates/${encodeURIComponent(certId)}/revoke`, { method: "POST", body: JSON.stringify({ reason }) })
 }
 
-// Teacher deletes any certificate (module or custom)
-export async function deleteCert(certId: string): Promise<{ success: boolean } | { error: string }> {
-  return apiFetch(`/api/certificates/${certId}`, { method: "DELETE" })
+// Subjects in a class (with lessons) that the signed-in teacher may issue certificates for
+export async function getCompletionSubjects(classId: string): Promise<{ subjects: string[] } | { error: string }> {
+  return apiFetch(`/api/certificates/completion/subjects?class_id=${encodeURIComponent(classId)}`)
+}
+
+// Who has completed a subject, who is in progress, and who already has a certificate
+export async function getSubjectCompletion(classId: string, subject: string): Promise<SubjectCompletion | { error: string }> {
+  return apiFetch(`/api/certificates/completion?class_id=${encodeURIComponent(classId)}&subject=${encodeURIComponent(subject)}`)
+}
+
+// Teacher issues subject-completion certificates to selected students
+export async function issueCompletionCertificates(data: {
+  class_id: string; subject: string; student_ids: string[]; cert_template: CertTemplateKey
+}): Promise<{ issued: number; skipped: Array<{ student_id: string; name: string; reason: string }> } | { error: string }> {
+  return apiFetch("/api/certificates/issue-completion", { method: "POST", body: JSON.stringify(data) })
 }
 
 // Teacher: open preview in new tab
@@ -477,19 +508,31 @@ export function previewCertPDF(data: Omit<CertTemplate, "logo_gridfs_id">): void
     })
 }
 
-// Teacher: bulk download ZIP for a module
-export function bulkDownloadCerts(classId: string, moduleId: string): void {
-  const BACKEND = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:4000"
-  fetch(`${BACKEND}/api/certificates/bulk-generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ class_id: classId, module_id: moduleId }),
-    credentials: "include",
-  }).then(r => {
-    if (!r.ok) throw new Error("Failed")
-    return r.blob()
-  }).then(blob => {
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob)
-    a.download = `Certificates_${moduleId}.zip`; a.click()
-  })
+// Teacher: ZIP of active certificates for a module, or for a subject (subject certificates).
+// Resolves to an error message, or null when the download started.
+export async function bulkDownloadCerts(classId: string, target: { moduleId: string } | { subject: string }): Promise<string | null> {
+  const body = "moduleId" in target
+    ? { class_id: classId, module_id: target.moduleId }
+    : { class_id: classId, subject: target.subject }
+  try {
+    const r = await fetch(`${BACKEND}/api/certificates/bulk-generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": crypto.randomUUID() },
+      body: JSON.stringify(body),
+      credentials: "include",
+    })
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}))
+      return (data as { error?: string }).error ?? "Could not prepare the download. Please try again."
+    }
+    const url = URL.createObjectURL(await r.blob())
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `Certificates_${("moduleId" in target ? target.moduleId : target.subject).replace(/[^\w-]/g, "_")}.zip`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    return null
+  } catch {
+    return "Network error — could not download the certificates."
+  }
 }

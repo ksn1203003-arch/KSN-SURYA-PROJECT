@@ -4,8 +4,9 @@
 // Handles profile photo upload, notifications bell, and teacher clock-in/out.
 // ─────────────────────────────────────────────────────────────────────────────
 import { useState, useEffect, useRef, type ReactNode } from "react"
-import { useNavigate } from "react-router-dom"
+import { useLocation, useNavigate } from "react-router-dom"
 import { Menu, X, LogOut, Bell, Search, Mail, BookOpen, Star, CheckCheck, Timer } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
 import { useAuth } from "@/contexts/AuthContext"
 import { uploadAvatar, getClockStatus, clockIn, clockOut, getMyNotifications, markNotificationRead, markAllNotificationsRead, type AppNotification } from "@/lib/userApi"
@@ -25,6 +26,9 @@ interface DashboardLayoutProps {
   userEmail?: string
   navItems: NavItem[]
   activeView?: string
+  // When true, keyboard focus moves to the main content area whenever activeView changes
+  // (not on first load), so screen-reader and keyboard users are told the section changed.
+  moveFocusOnViewChange?: boolean
   children: ReactNode
   instructor?: { name: string; subject: string; initials: string }
   classmates?: { name: string; points: number; initials: string }[]
@@ -147,8 +151,15 @@ function timeAgo(dateStr: string): string {
   return `${days} days ago`
 }
 
+// A redirect (e.g. a wrong-role link) can pass a short message through the router's location state.
+function readNotice(state: unknown): string | null {
+  if (typeof state !== "object" || state === null || !("notice" in state)) return null
+  const { notice } = state as { notice: unknown }
+  return typeof notice === "string" && notice.length > 0 ? notice : null
+}
+
 export function DashboardLayout({
-  role, userName, userSubtitle = "", userEmail = "", navItems, activeView, children,
+  role, userName, userSubtitle = "", userEmail = "", navItems, activeView, moveFocusOnViewChange = false, children,
   instructor, classmates, onSettingsClick,
   studentPoints = null, studentAttendance = null,
   onClockIn, onClockOut,
@@ -165,7 +176,43 @@ export function DashboardLayout({
   const [expandedNotif,    setExpandedNotif]     = useState<string | null>(null)
 
   const navigate = useNavigate()
+  const location = useLocation()
   const { signOut, user, refreshUser } = useAuth()
+
+  // Focus moves to the main area when the section or the address changes (e.g. opening a subject),
+  // never on first load, so keyboard and screen-reader users know the content changed.
+  const mainRef = useRef<HTMLElement>(null)
+  const pathname = location.pathname
+  const viewKey = `${pathname}|${activeView ?? ""}`
+  const previousViewKeyRef = useRef(viewKey)
+  useEffect(() => {
+    if (previousViewKeyRef.current === viewKey) return
+    previousViewKeyRef.current = viewKey
+    if (moveFocusOnViewChange) mainRef.current?.focus({ preventScroll: true })
+  }, [viewKey, moveFocusOnViewChange])
+
+  // A redirect's notice is shown once: it is copied into local state and removed from the history
+  // entry straight away, so a Refresh or Back to this page does not repeat it. It stays until it is
+  // dismissed or the user goes to another page.
+  const [notice, setNotice] = useState<string | null>(null)
+  const noticePathRef = useRef(pathname)
+  // Declared before the effect below so that, when a new notice arrives together with a new address,
+  // the new notice is the one that is kept.
+  useEffect(() => {
+    if (noticePathRef.current === pathname) return
+    noticePathRef.current = pathname
+    setNotice(null)
+  }, [pathname])
+  useEffect(() => {
+    const incoming = readNotice(location.state)
+    if (!incoming) return
+    setNotice(incoming)
+    navigate(pathname, { replace: true, state: null })
+  }, [location.state, pathname, navigate])
+  const dismissNotice = () => {
+    setNotice(null)
+    mainRef.current?.focus({ preventScroll: true })
+  }
 
   // Verify clock state from backend on mount — never trust stale localStorage alone.
   // This prevents the timer running when the teacher hasn't explicitly clocked in.
@@ -356,10 +403,10 @@ export function DashboardLayout({
       <div className="flex flex-col h-full overflow-hidden">
 
         {/* ── Profile card at top of sidebar ── */}
-        <div className="px-2.5 pt-3 pb-2">
+        <div className="px-2.5 pt-3 pb-3">
           <div
-            className="p-2.5 rounded-xl flex items-center gap-2.5"
-            style={{ background: "rgba(83,74,183,0.06)", border: "1px solid rgba(83,74,183,0.1)" }}
+            className="p-3 rounded-2xl flex items-center gap-2.5 shadow-sm"
+            style={{ background: "rgba(83,74,183,0.08)", border: "1px solid rgba(83,74,183,0.14)" }}
           >
             {/* Avatar — click to change photo */}
             <div
@@ -508,12 +555,16 @@ export function DashboardLayout({
     <div className="flex h-screen overflow-hidden" style={{ background: "var(--background)" }}>
 
       {/* ── Desktop sidebar ──────────────────────────────────────────────────── */}
+      {/* No border lines at the sidebar/navbar junction (top-left corner) — a
+          hard-edged vertical + horizontal border crossing there reads as a messy
+          "+" seam. Separation comes from the background-color difference alone
+          (--card vs --background), the same pattern Notion/Linear/Vercel use. */}
       <aside
         className="hidden md:flex flex-col w-[230px] flex-shrink-0 h-full relative overflow-hidden"
-        style={{ background: "var(--card)", borderRight: "1px solid var(--border)", boxShadow: "1px 0 0 var(--border)" }}
+        style={{ background: "var(--card)" }}
       >
         <div className="relative z-10 flex flex-col h-full">
-          <div className="flex items-center px-4 h-14" style={{ borderBottom: "1px solid var(--border)" }}>
+          <div className="flex items-center px-5" style={{ height: 56 }}>
             <Logo />
           </div>
           <LightSidebarContent />
@@ -546,7 +597,7 @@ export function DashboardLayout({
       <div className="flex-1 flex flex-col overflow-hidden">
 
         {/* Top bar */}
-        <header className="flex items-center gap-3 px-4 md:px-5 flex-shrink-0 z-10 relative" style={{ background: "var(--card)", borderBottom: "1px solid var(--border)", height: 56, boxShadow: "0 1px 0 var(--border)" }}>
+        <header className="flex items-center gap-3 px-4 md:px-5 flex-shrink-0 z-10 relative" style={{ background: "var(--card)", height: 56, boxShadow: "0 1px 2px rgba(0,0,0,0.06)" }}>
           <button className="cursor-pointer md:hidden text-muted-foreground hover:text-foreground transition-colors w-11 h-11 -ml-2 rounded-lg hover:bg-accent flex items-center justify-center" onClick={() => setMobileOpen(true)} aria-label="Open navigation menu" aria-expanded={mobileOpen}>
             <Menu className="w-5 h-5" />
           </button>
@@ -795,8 +846,9 @@ export function DashboardLayout({
                 )}
               </div>
 
-              {/* Stats — only for student, not teacher/admin */}
-              {role === "student" && (
+              {/* Stats — only for student, and only once the dashboard summary has been loaded
+                  (it is fetched by the Dashboard/Lessons screens, never just for this panel) */}
+              {role === "student" && (studentPoints != null || studentAttendance != null) && (
                 <div className="grid grid-cols-2 gap-2 mb-4">
                   {[
                     { label: "Points",     value: studentPoints     != null ? String(studentPoints)          : "—", color: "#F59E0B" },
@@ -832,12 +884,30 @@ export function DashboardLayout({
 
         {/* ── Scrollable content ─────────────────────────────────────────────── */}
         <main
-          className={`flex-1 overflow-y-auto p-4 md:p-6 pb-20 md:pb-6 relative ${role === "student" ? "dashboard-bg-student" : ""}`}
+          ref={mainRef}
+          tabIndex={-1}
+          aria-label="Main content"
+          className={`flex-1 overflow-y-auto p-4 md:p-6 pb-20 md:pb-6 relative outline-none ${role === "student" ? "dashboard-bg-student" : ""}`}
         >
           <div className="absolute inset-0 pointer-events-none" style={{
             backgroundImage: "linear-gradient(rgba(83,74,183,0.025) 1px,transparent 1px),linear-gradient(90deg,rgba(83,74,183,0.025) 1px,transparent 1px)",
             backgroundSize: "40px 40px",
           }} />
+          {/* The live region is always mounted so a notice that appears later is announced. */}
+          <div role="status" aria-live="polite" className="relative z-10">
+            {notice && (
+              <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3 text-sm text-foreground">
+                <span>{notice}</span>
+                <Button
+                  type="button" variant="ghost" size="icon" className="h-8 w-8 shrink-0 cursor-pointer"
+                  aria-label="Dismiss notice"
+                  onClick={dismissNotice}
+                >
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+            )}
+          </div>
           <div className="relative z-10">{children}</div>
         </main>
 

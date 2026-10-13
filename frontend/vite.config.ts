@@ -25,16 +25,32 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
+        // Pre-download only the app shell (page, styles, the main script, icons). Each role's dashboard
+        // chunk is fetched the first time it is opened and then kept by the runtime rule below — a student
+        // no longer downloads the teacher and admin dashboards on first install.
+        globPatterns: ["**/*.{html,css,ico,svg,woff2}", "assets/index-*.js", "icons/*.png"],
+        // Deep links such as /student/dashboard/lessons are answered with the app shell (index.html), but
+        // API calls, health checks and anything that looks like a file (certificate PDFs, downloads)
+        // must always reach the network and never be answered from the cache.
+        navigateFallbackDenylist: [/^\/api\//, /^\/health/, /\/[^/?]+\.[^/]+$/],
         runtimeCaching: [
           {
-            // Cache static assets only — API responses are intentionally excluded
-            // to prevent stale auth or lesson data being served from the SW cache.
-            urlPattern: /\.(png|jpg|jpeg|svg|gif|webp)$/,
+            // Built JS/CSS chunks have content hashes in their names, so a cached copy is never stale
+            urlPattern: ({ url, sameOrigin }) => sameOrigin && url.pathname.startsWith("/assets/") && /\.(js|css)$/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "app-chunks",
+              expiration: { maxEntries: 60, maxAgeSeconds: 30 * 24 * 60 * 60 },
+            },
+          },
+          {
+            // Only the app's own static pictures. Anything from the API (profile photos, logos,
+            // certificates) is personal data and must never be kept in a cache on a shared school computer.
+            urlPattern: ({ url, sameOrigin }) => sameOrigin && !url.pathname.startsWith("/api/") && /\.(png|jpg|jpeg|svg|gif|webp)$/.test(url.pathname),
             handler: "CacheFirst",
             options: {
               cacheName: "images-cache",
-              expiration: { maxEntries: 100, maxAgeSeconds: 30 * 24 * 60 * 60 },
+              expiration: { maxEntries: 60, maxAgeSeconds: 30 * 24 * 60 * 60 },
             },
           },
         ],

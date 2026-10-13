@@ -60,6 +60,10 @@ export interface ChildAttendance {
   late: number
   absent: number
   rate: number | null
+  recorded?: boolean
+  // Attendance is counted from the class's school-year start (YYYY-MM-DD); null = every recorded sheet
+  counted_from?: string | null
+  counted_class_label?: string | null
 }
 
 export interface ModuleProgress {
@@ -97,6 +101,11 @@ export interface ChildCertificate {
   class_label: string
   issued_at: string
   type: string
+  custom_title?: string
+  // Older certificates have no status — a missing status means "active"
+  status?: "active" | "revoked"
+  revoked_at?: string | null
+  revoke_reason?: string
 }
 
 export async function getChildProfile() {

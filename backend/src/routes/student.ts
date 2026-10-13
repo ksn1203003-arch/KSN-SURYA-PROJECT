@@ -15,10 +15,28 @@ import { StudentActivity } from "../models/StudentActivity.js"
 import { ChallengeSubmission } from "../models/ChallengeSubmission.js"
 import { Class } from "../models/Class.js"
 import { todayIST as todayStr, weekStartIST as weekStartStr, academicYearStartIST as academicYearStartStr } from "../lib/dateHelpers.js"
-import { calculateAttendanceRate } from "../lib/attendanceHelpers.js"
+import {
+  calculateAttendanceRate,
+  attendanceDateFilter,
+  classLabelOf,
+  countedFields,
+  floorFrom,
+  isYmd,
+  loadCountedClass,
+  type CountedClass,
+} from "../lib/attendanceHelpers.js"
+import { PHOTO_VERSION_PROJECTION, photoPath } from "../lib/userPhoto.js"
 
 const router = Router()
 router.use(requireAuth)
+
+// The "counted from" date and label of a class that was already read (a class not found = null).
+function countedOf(
+  c: { year_start?: string | null; grade: number; section: string; name?: string | null } | null | undefined,
+): CountedClass | null {
+  if (!c) return null
+  return { start: isYmd(c.year_start) ? c.year_start : null, label: classLabelOf(c) }
+}
 
 // Convert "HH:MM" or "H:MM" to minutes since midnight
 function timeToMinutes(t: string): number {
@@ -26,8 +44,32 @@ function timeToMinutes(t: string): number {
   return (h || 0) * 60 + (m || 0)
 }
 
+// Consecutive days with a login, ending today. Reads the activity history newest
+// first and stops at the first gap, so a long history is never read in full.
+async function loginStreak(studentId: mongoose.Types.ObjectId, todayIST: string): Promise<number> {
+  let streak = 0
+  let checkDateStr = todayIST
+  const cursor = StudentActivity.find({ student_id: studentId })
+    .sort({ date: -1 }).select("date logins").lean().batchSize(32).cursor()
+  try {
+    for await (const act of cursor) {
+      if (act.date === checkDateStr && act.logins > 0) {
+        streak++
+        const prev = new Date(checkDateStr + "T00:00:00+05:30")
+        prev.setDate(prev.getDate() - 1)
+        checkDateStr = prev.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
+      } else break
+    }
+  } finally {
+    await cursor.close()
+  }
+  return streak
+}
+
 // ── GET /api/student/dashboard ────────────────────────────────────────────────
-// Returns all stats needed to populate the student dashboard in one call
+// Returns all stats needed to populate the student dashboard in one call.
+// Every query reads only the fields the numbers need (item ids, not file details;
+// this student's attendance marks, not the whole class's).
 router.get("/dashboard", async (req: AuthRequest, res: Response) => {
   try {
     const studentId = new mongoose.Types.ObjectId(req.userId!)
@@ -48,13 +90,20 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
     const wkStartDate = new Date(wkStart)
     const todayIST   = todayStr()
 
+    // The student's class inside their school: the timetable for the chart and the date the
+    // attendance is counted from. Started once here and awaited by both users below.
+    const classRead = Class.findOne({ _id: classId, school_id: schoolId })
+      .select("timetable year_start grade section name")
+      .lean()
+      .exec()
+
     // Fan out all independent DB queries in parallel — avoids sequential round-trips
     const [
       modules,
       viewedRecords,
       attempts,
       activityRecordsWeek,
-      allActivity,
+      streak_days,
       cls,
       todayAct,
       goodQuiz,
@@ -62,22 +111,33 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
       rawAttDocs,
       rawEvents,
     ] = await Promise.all([
-      Module.find({ school_id: schoolId, class_id: classId }).lean(),
-      ModuleProgress.find({ student_id: studentId }).lean(),
-      QuizAttempt.find({ student_id: studentId }).lean(),
-      StudentActivity.find({ student_id: studentId, date: { $gte: mondayStr } }).lean(),
-      StudentActivity.find({ student_id: studentId }).sort({ date: -1 }).lean(),
-      Class.findById(classId).select("timetable").lean(),
-      StudentActivity.findOne({ student_id: studentId, date: todayIST }).lean(),
-      QuizAttempt.findOne({ student_id: studentId, percentage: { $gte: 80 }, submitted_at: { $gte: wkStartDate } }).lean(),
-      ChallengeSubmission.findOne({ student_id: studentId, submitted_at: { $gte: wkStartDate } }).lean(),
+      Module.find({ school_id: schoolId, class_id: classId }).select("subject title items._id").lean(),
+      ModuleProgress.find({ student_id: studentId }).select("item_id").lean(),
+      QuizAttempt.find({ student_id: studentId }).select("percentage").lean(),
+      StudentActivity.find({ student_id: studentId, date: { $gte: mondayStr } }).select("date minutes_active").lean(),
+      loginStreak(studentId, todayIST),
+      classRead,
+      StudentActivity.findOne({ student_id: studentId, date: todayIST }).select("logins items_viewed").lean(),
+      QuizAttempt.exists({ student_id: studentId, percentage: { $gte: 80 }, submitted_at: { $gte: wkStartDate } }),
+      ChallengeSubmission.exists({ student_id: studentId, submitted_at: { $gte: wkStartDate } }),
       (async () => {
         const db = mongoose.connection.db
         if (!db) return []
-        return db.collection("attendances").find({
-          class_id: classId,
-          "records.student_id": studentId,
-        }).toArray().catch(() => [])
+        // A class that cannot be found in the school, or whose start date is still ahead, counts nothing.
+        // The date window sits in the first $match so the {class_id, date} index serves it.
+        const counted = countedOf(await classRead)
+        if (!counted || (counted.start && counted.start > todayIST)) return []
+        // Only this student's marks leave the database, not every classmate's
+        return db.collection("attendances").aggregate([
+          { $match: { class_id: classId, "records.student_id": studentId, ...attendanceDateFilter(counted.start) } },
+          { $project: {
+            date: 1,
+            records: { $filter: {
+              input: "$records",
+              cond:  { $eq: [{ $toString: "$$this.student_id" }, studentId.toString()] },
+            } },
+          } },
+        ]).toArray().catch(() => [])
       })(),
       (async () => {
         const db = mongoose.connection.db
@@ -89,6 +149,12 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
               { $or: [{ school_id: schoolId }, { school_id: schoolId.toString() }] },
               { expires_at: { $gte: now } },
               { $or: [{ scheduled_at: null }, { scheduled_at: { $lte: now } }] },
+              // Only messages meant for everyone, for students, or for this student's class —
+              // never staff-only messages or another class's
+              { $or: [
+                { target: { $in: ["all", "students", classId.toString()] } },
+                { target: { $exists: false } },
+              ] },
             ],
           })
           .sort({ scheduled_at: 1, createdAt: -1 })
@@ -121,12 +187,19 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
     // Attendance
     const myRecords = rawAttDocs.flatMap((doc: Record<string, unknown>) => {
       const records = doc.records as Array<{ student_id: unknown; status: string }> | undefined
-      return (records ?? []).filter(r => r.student_id?.toString() === studentId.toString())
+      return (records ?? [])
+        .filter(r => r.student_id?.toString() === studentId.toString())
+        .map(r => ({ ...r, date: doc.date as string }))
     })
     const days_total    = myRecords.length
     const days_present  = myRecords.filter(r => r.status === "present").length
     const days_late     = myRecords.filter(r => r.status === "late").length
     const attendance_rate = calculateAttendanceRate(days_present, days_late, days_total) ?? 0
+    // Distinct calendar days attendance has actually been recorded on — days_total
+    // above counts individual PERIOD-level records, not days (a day with 8 periods
+    // marked contributes 8 to days_total, not 1), so this is tracked separately.
+    const days_recorded = new Set(myRecords.map(r => r.date)).size
+    const countedClass = countedOf(cls)
 
     // Weekly activity chart
     const activityMap: Record<string, number> = {}
@@ -157,18 +230,6 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
       }
     })
 
-    // Streak: consecutive days with activity ending today
-    let streak_days = 0
-    let checkDateStr = todayIST
-    for (const act of allActivity) {
-      if (act.date === checkDateStr && act.logins > 0) {
-        streak_days++
-        const prev = new Date(checkDateStr + "T00:00:00+05:30")
-        prev.setDate(prev.getDate() - 1)
-        checkDateStr = prev.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
-      } else break
-    }
-
     // Points
     const loggedToday = (todayAct?.logins ?? 0) > 0
     const itemsToday  = todayAct?.items_viewed ?? 0
@@ -191,12 +252,20 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
       .filter(m => m.total > 0 && m.completed > 0 && m.completed < m.total)
       .slice(0, 3)
 
-    const upcoming_events = rawEvents
+    const upcoming_events = (rawEvents as Array<{ _id: unknown; title: string; message: string; type: string; createdAt?: Date; scheduled_at?: Date | null }>).map(evt => ({
+      _id:          String(evt._id),
+      title:        evt.title,
+      message:      evt.message,
+      type:         evt.type,
+      created_at:   (evt.scheduled_at ?? evt.createdAt ?? new Date()).toString(),
+    }))
 
     // Update points using $max so the stored value never decreases.
     // Using a plain $set here would overwrite historically-earned points with a lower
     // current-week score if the student earned more in a previous week.
-    await User.findByIdAndUpdate(studentId, { $max: { points: points_total } })
+    // The filter skips the write entirely when the stored value is already as high.
+    // ($not/$gte also matches a record that has no points stored yet.)
+    await User.updateOne({ _id: studentId, points: { $not: { $gte: points_total } } }, { $max: { points: points_total } })
 
     res.json({
       modules_completed,
@@ -206,7 +275,9 @@ router.get("/dashboard", async (req: AuthRequest, res: Response) => {
       quizzes_taken,
       days_present,
       days_total,
+      days_recorded,
       attendance_rate,
+      ...countedFields(countedClass),
       streak_days,
       module_progress: Object.entries(module_progress).map(([subject, v]) => ({ subject, ...v })),
       weekly_activity,
@@ -454,7 +525,8 @@ router.get("/teachers", async (req: AuthRequest, res: Response) => {
       _id:       { $in: teacherIds },
       school_id: student.school_id,
       role:      "teacher",
-    }).select("name profile_photo_url").lean()
+      is_active: true,
+    }).select({ name: 1, ...PHOTO_VERSION_PROJECTION }).lean<Array<{ _id: mongoose.Types.ObjectId; name: string; photo_v: number | null }>>()
 
     const subjectMap: Record<string, string[]> = {}
     cls.teachers.forEach((t: { teacher_id?: mongoose.Types.ObjectId | null; subject?: string }) => {
@@ -467,7 +539,7 @@ router.get("/teachers", async (req: AuthRequest, res: Response) => {
     const teachers = teacherDocs.map(t => ({
       id:                t._id.toString(),
       name:              t.name,
-      profile_photo_url: t.profile_photo_url ?? null,
+      photo_url:         photoPath(t._id.toString(), t.photo_v),
       subjects:          subjectMap[t._id.toString()] ?? [],
     }))
 
@@ -483,14 +555,15 @@ router.get("/teachers", async (req: AuthRequest, res: Response) => {
 // Called only when the student clicks "Check" — not on page load.
 router.get("/attendance/range", async (req: AuthRequest, res: Response) => {
   const EMPTY = { total: 0, present: 0, absent: 0, late: 0, rate: 0, recorded: false }
+  const NO_CLASS = countedFields(null)
 
   try {
     const studentId = new mongoose.Types.ObjectId(req.userId!)
-    const student   = await User.findById(studentId).select("class_id").lean()
-    if (!student?.class_id) { res.json({ result: EMPTY }); return }
+    const student   = await User.findById(studentId).select("class_id school_id").lean()
+    if (!student?.class_id) { res.json({ result: EMPTY, ...NO_CLASS }); return }
 
     const db = mongoose.connection.db
-    if (!db) { res.json({ result: EMPTY }); return }
+    if (!db) { res.json({ result: EMPTY, ...NO_CLASS }); return }
 
     const todayIST = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
     const dateRe   = /^\d{4}-\d{2}-\d{2}$/
@@ -510,8 +583,17 @@ router.get("/attendance/range", async (req: AuthRequest, res: Response) => {
 
     const classId = student.class_id as mongoose.Types.ObjectId
 
+    // The class inside the student's school; one that cannot be found counts nothing (fail closed)
+    const counted = await loadCountedClass(classId, student.school_id)
+    if (!counted) { res.json({ result: EMPTY, ...NO_CLASS }); return }
+    const countedOut = countedFields(counted)
+
+    // Sheets before the class's start date are never counted: a range that begins earlier is clamped to it.
+    // A start that is still ahead (or a range wholly before it) leaves lower > to, which matches nothing.
+    const lower = floorFrom(counted.start, from) ?? from
+
     const [result] = await db.collection("attendances").aggregate([
-      { $match: { class_id: classId, date: { $gte: from, $lte: to } } },
+      { $match: { class_id: classId, date: { $gte: lower, $lte: to } } },
       { $unwind: "$records" },
       { $match: { "records.student_id": studentId } },
       { $group: {
@@ -523,14 +605,14 @@ router.get("/attendance/range", async (req: AuthRequest, res: Response) => {
       }},
     ]).toArray()
 
-    if (!result?.total) { res.json({ result: EMPTY }); return }
+    if (!result?.total) { res.json({ result: EMPTY, ...countedOut }); return }
 
     const { total, present, absent, late } = result as { total: number; present: number; absent: number; late: number }
     const rate = calculateAttendanceRate(present, late, total) ?? 0
-    res.json({ result: { total, present, absent, late, rate, recorded: true } })
+    res.json({ result: { total, present, absent, late, rate, recorded: true }, ...countedOut })
   } catch (err) {
     logger.error({ err: err }, "[student/attendance/range]")
-    res.json({ result: EMPTY })
+    res.json({ result: EMPTY, ...NO_CLASS })
   }
 })
 
@@ -541,21 +623,48 @@ router.get("/attendance/range", async (req: AuthRequest, res: Response) => {
 router.get("/attendance", async (req: AuthRequest, res: Response) => {
   const EMPTY = { total: 0, present: 0, absent: 0, late: 0, rate: 0, recorded: false }
   const safeSummary = { today: EMPTY, this_week: EMPTY, this_month: EMPTY, overall: EMPTY }
+  const NO_CLASS = countedFields(null)
 
   try {
     const studentId = new mongoose.Types.ObjectId(req.userId!)
-    const student   = await User.findById(studentId).select("class_id").lean()
+    const student   = await User.findById(studentId).select("class_id school_id").lean()
 
-    if (!student?.class_id) { res.json({ summary: safeSummary, records: [] }); return }
+    if (!student?.class_id) { res.json({ summary: safeSummary, records: [], ...NO_CLASS }); return }
 
     const db = mongoose.connection.db
-    if (!db) { res.json({ summary: safeSummary, records: [] }); return }
+    if (!db) { res.json({ summary: safeSummary, records: [], ...NO_CLASS }); return }
 
     const classId   = student.class_id as mongoose.Types.ObjectId
     const todayIST  = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }) // YYYY-MM-DD
     const weekIST   = weekStartStr()                                                         // YYYY-MM-DD (Monday IST)
     const monthIST  = `${todayIST.slice(0, 7)}-01`                                          // YYYY-MM-01
-    const yearIST   = academicYearStartStr()                                                 // YYYY-06-01 (academic year)
+    const yearDefault = academicYearStartStr()                                               // YYYY-06-01 (academic year)
+
+    // The class inside the student's school; one that cannot be found counts nothing (fail closed)
+    const counted = await loadCountedClass(classId, student.school_id)
+    if (!counted) {
+      res.json({
+        summary: { today: EMPTY, this_week: EMPTY, this_month: EMPTY, this_year: EMPTY },
+        records: [],
+        ...NO_CLASS,
+      })
+      return
+    }
+    const countedOut = countedFields(counted)
+
+    // A start date that is still ahead counts nothing at all
+    if (counted.start && counted.start > todayIST) {
+      res.json({
+        summary: { today: EMPTY, this_week: EMPTY, this_month: EMPTY, this_year: EMPTY },
+        records: [],
+        ...countedOut,
+      })
+      return
+    }
+
+    // Every window and the calendar list start no earlier than the class's start date.
+    // The school year window is the later of the usual school-year start and the stored start.
+    const yearIST = floorFrom(counted.start, yearDefault) ?? yearDefault
 
     // Shared $group accumulator for all four time-range facets
     const groupAccum = {
@@ -567,7 +676,7 @@ router.get("/attendance", async (req: AuthRequest, res: Response) => {
     }
 
     const [result] = await db.collection("attendances").aggregate([
-      { $match: { class_id: classId } },
+      { $match: { class_id: classId, ...attendanceDateFilter(counted.start) } },
       { $unwind: "$records" },
       { $match: { "records.student_id": studentId } },
       { $facet: {
@@ -617,10 +726,11 @@ router.get("/attendance", async (req: AuthRequest, res: Response) => {
         this_year:  toSlot(r?.this_year  ?? []),
       },
       records: r?.records ?? [],
+      ...countedOut,
     })
   } catch (err) {
     logger.error({ err: err }, "[student/attendance]")
-    res.json({ summary: safeSummary, records: [] }) // safe fallback — page never breaks
+    res.json({ summary: safeSummary, records: [], ...NO_CLASS }) // safe fallback — page never breaks
   }
 })
 

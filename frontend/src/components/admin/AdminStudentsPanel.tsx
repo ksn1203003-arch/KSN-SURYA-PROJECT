@@ -10,15 +10,74 @@ import {
   BookMarked, FileQuestion, Loader2, Users,
 } from "lucide-react"
 import {
-  Modal, Spinner, SectionHeader, Empty, CopyBtn, StudentAvatar,
+  Modal, Spinner, SectionHeader, Empty, CopyBtn, ListPager, usePagedRows,
   downloadStudentCredential, downloadBulkStudentCredentials,
 } from "./adminComponents"
-import { CLASS_COLORS, clsLabel } from "./adminShared"
+import { clsLabel } from "./adminShared"
+import { formatYmdForDisplay } from "./adminTypes"
 import type {
   ClassRow, StudentRow, StudentDetail, BulkResult,
-  AttPeriod, StudentAttDetail,
+  AttPeriod, StudentAttDetail, ClassHistoryLine,
 } from "./adminTypes"
 import { parseStudentFile, addParent, getParents, removeUser } from "@/lib/userApi"
+import { UserPhoto } from "@/components/UserPhoto"
+import { attendanceBasisLabel, formatCountedDate, istTodayYmd } from "@/lib/attendanceBasis"
+
+// Sentences for the attendance figure of the open student row, kept in one place so Hindi can be added later
+const ATTENDANCE_TEXT = {
+  noData: "No data",
+  noAttendanceSince: (date: string) => `No attendance recorded since ${date}`,
+}
+
+const END_REASON_LABEL: Record<string, string> = {
+  promoted: "Moved to next class",
+  stayed_back: "Stayed in same class",
+  passed_out: "Passed out",
+  transferred: "Moved class",
+  correction: "Corrected",
+}
+
+// The student's classes over time, oldest first — shown in the expanded student row (admin screen only)
+function ClassHistorySection({ history, onRetry }: { history: ClassHistoryLine[] | undefined; onRetry: () => void }) {
+  return (
+    <section aria-label="Class history" className="rounded-xl border border-border bg-card px-4 py-3">
+      <div className="flex items-center gap-1.5 text-muted-foreground mb-2">
+        <GraduationCap className="w-3 h-3" />
+        <h4 className="text-[11px] uppercase tracking-wider font-semibold">Class history</h4>
+      </div>
+      {history === undefined ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-xs text-muted-foreground">Class history could not be loaded.</p>
+          <Button type="button" variant="outline" size="sm" className="h-7 text-xs rounded-lg" onClick={onRetry}>Try again</Button>
+        </div>
+      ) : history.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No class history yet.</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {history.map((line, i) => {
+            const badge = line.is_current ? "Current" : (line.end_reason ? (END_REASON_LABEL[line.end_reason] ?? "Class changed") : undefined)
+            return (
+              <li key={`${line.from_date}-${i}`} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                <span className="font-semibold text-foreground">{line.class_label ?? "Unknown class"}</span>
+                {line.class_deleted && <span className="text-muted-foreground">(class removed)</span>}
+                <span className="text-muted-foreground">
+                  {line.is_current || !line.to_date
+                    ? `Since ${formatYmdForDisplay(line.from_date)}`
+                    : `${formatYmdForDisplay(line.from_date)} – ${formatYmdForDisplay(line.to_date)}`}
+                </span>
+                {badge && (
+                  <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${line.is_current ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" : "bg-muted text-muted-foreground"}`}>
+                    {badge}
+                  </span>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
+}
 
 interface ParentRecord { id: string; name: string; email: string; is_active: boolean; created_at: string | null }
 
@@ -204,6 +263,7 @@ interface AdminStudentsPanelProps {
   studentDetailMap: Record<string, StudentDetail>
   studentDetailLoading: string | null
   handleToggleStudent: (id: string) => void
+  retryStudentDetail: (id: string) => void
   studentAttPeriod: AttPeriod
   setStudentAttPeriod: (p: AttPeriod) => void
   studentAttCache: Record<string, StudentAttDetail>
@@ -251,7 +311,7 @@ export default function AdminStudentsPanel({
   selectedIds, setSelectedIds, showBulkActions, setShowBulkActions,
   bulkActionClass, setBulkActionClass, bulkActionGender, setBulkActionGender,
   bulkActionLoading, handleBulkAction,
-  expandedStudentId, studentDetailMap, studentDetailLoading, handleToggleStudent,
+  expandedStudentId, studentDetailMap, studentDetailLoading, handleToggleStudent, retryStudentDetail,
   studentAttPeriod, setStudentAttPeriod, studentAttCache, studentAttLoading,
   studentAttCustomFrom, setStudentAttCustomFrom, studentAttCustomTo, setStudentAttCustomTo, loadStudentAtt,
   showStudentModal, setShowStudentModal, studentForm, setStudentForm,
@@ -261,6 +321,11 @@ export default function AdminStudentsPanel({
   editStudent, setEditStudent, editForm, setEditForm, editErr, editLoading, handleEditStudent,
   confirmRemove, setConfirmRemove, handleRemove, removeLoading,
 }: AdminStudentsPanelProps) {
+  const studentPager = usePagedRows(filteredStudents, `${searchStudents}|${filterClass}`)
+  const pageIds = studentPager.pageRows.map(s => s.id)
+  const pageAllSelected = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id))
+  const selectedCount = filteredStudents.filter(s => selectedIds.has(s.id)).length
+  const selectedOffPage = selectedCount - pageIds.filter(id => selectedIds.has(id)).length
   const csvRef = useRef<HTMLInputElement>(null)
 
   return (
@@ -299,7 +364,9 @@ export default function AdminStudentsPanel({
       {/* Bulk actions bar */}
       {filteredStudents.some(s => selectedIds.has(s.id)) && (
         <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg border border-border bg-muted/60 flex-wrap">
-          <span className="text-xs font-semibold text-foreground mr-1">{filteredStudents.filter(s => selectedIds.has(s.id)).length} selected</span>
+          <span className="text-xs font-semibold text-foreground mr-1">
+            {selectedCount} selected{selectedOffPage > 0 ? ` (${selectedOffPage} on other pages)` : ""}
+          </span>
           <button onClick={() => setShowBulkActions(s => !s)}
             className="text-xs text-ts-blue font-medium hover:underline">{showBulkActions ? "Hide actions" : "Show actions"}</button>
           {showBulkActions && (
@@ -331,15 +398,27 @@ export default function AdminStudentsPanel({
                 </Button>
               </div>
               <Button size="sm" disabled={bulkActionLoading}
-                onClick={() => { const n = filteredStudents.filter(s => selectedIds.has(s.id)).length; if (confirm(`Delete ${n} student(s)? This cannot be undone.`)) handleBulkAction("delete") }}
+                onClick={() => {
+                  const offPage = selectedOffPage > 0 ? `, including ${selectedOffPage} not on this page` : ""
+                  if (confirm(`Delete ${selectedCount} student(s)${offPage}? This cannot be undone.`)) handleBulkAction("delete")
+                }}
                 className="h-7 text-xs rounded-md px-2 bg-red-500 hover:bg-red-600 text-white ml-auto">
-                {bulkActionLoading ? "…" : `Delete ${filteredStudents.filter(s => selectedIds.has(s.id)).length}`}
+                {bulkActionLoading ? "…" : `Delete ${selectedCount}`}
               </Button>
             </>
           )}
           <button onClick={() => setSelectedIds(() => new Set())}
             className="ml-auto text-xs text-muted-foreground hover:text-foreground">Clear</button>
         </div>
+      )}
+      {pageAllSelected && selectedCount < filteredStudents.length && (
+        <p role="status" className="mb-3 px-3 py-2 rounded-lg bg-muted/60 text-xs text-foreground">
+          All {pageIds.length} students on this page are selected.{" "}
+          <button className="font-semibold text-ts-blue hover:underline"
+            onClick={() => setSelectedIds(() => new Set(filteredStudents.map(s => s.id)))}>
+            Select all {filteredStudents.length} matching students
+          </button>
+        </p>
       )}
 
       {/* Summary stats bar */}
@@ -374,7 +453,8 @@ export default function AdminStudentsPanel({
           </Button>}
         />
       ) : (
-        <div className="skillio-card rounded-xl overflow-x-auto">
+        <>
+        <div id="students-table" tabIndex={-1} aria-label="Students list" className="skillio-card rounded-xl overflow-x-auto scroll-mt-4 focus:outline-none">
           <table className="w-full text-sm border-collapse">
             <colgroup>
               <col style={{ width: "40px" }} />
@@ -390,12 +470,13 @@ export default function AdminStudentsPanel({
             <thead>
               <tr style={{ background: "var(--muted)" }}>
                 <th className="px-4 py-3">
-                  <input type="checkbox"
-                    checked={filteredStudents.length > 0 && filteredStudents.every(s => selectedIds.has(s.id))}
-                    onChange={e => {
-                      if (e.target.checked) setSelectedIds(() => new Set(filteredStudents.map(s => s.id)))
-                      else setSelectedIds(() => new Set())
-                    }}
+                  <input type="checkbox" aria-label="Select all students on this page"
+                    checked={pageAllSelected}
+                    onChange={e => setSelectedIds(prev => {
+                      const next = new Set(prev)
+                      pageIds.forEach(id => { if (e.target.checked) next.add(id); else next.delete(id) })
+                      return next
+                    })}
                     className="w-3.5 h-3.5 rounded cursor-pointer accent-purple-600"
                   />
                 </th>
@@ -410,20 +491,26 @@ export default function AdminStudentsPanel({
               </tr>
             </thead>
             <tbody>
-              {filteredStudents.map((s, si) => {
+              {studentPager.pageRows.map(s => {
                 const checked = selectedIds.has(s.id)
                 const initials = s.name.split(" ").map((w: string) => w[0]).join("").slice(0, 2).toUpperCase()
                 const hasEmail = s.email && !s.email.includes(".internal.teachscript")
                 const isExpanded = expandedStudentId === s.id
                 const detail = studentDetailMap[s.id]
                 const isLoadingDetail = studentDetailLoading === s.id
+                // Which class and date the attendance figure was counted from (nothing is said by an older answer without the field)
+                const countedFrom = detail?.counted_from
+                const attendanceNoDataText = countedFrom ? ATTENDANCE_TEXT.noAttendanceSince(formatCountedDate(countedFrom)) : ATTENDANCE_TEXT.noData
+                const attendanceBasisLine = detail && countedFrom !== undefined
+                  ? attendanceBasisLabel({ countedFrom, className: detail.counted_class_label, todayYmd: istTodayYmd() })
+                  : ""
                 const joinedDate = s.created_at ? new Date(s.created_at).toLocaleDateString("en-IN", { month: "short", year: "numeric" }) : null
                 return (
                   <>
                     <tr key={s.id} onClick={() => setSelectedIds(prev => { const next = new Set(prev); checked ? next.delete(s.id) : next.add(s.id); return next })}
                       className={`border-t border-border transition-colors cursor-pointer select-none ${checked ? "bg-purple-50/60 dark:bg-purple-900/10" : isExpanded ? "bg-muted/40" : "hover:bg-muted/30"}`}>
                       <td className="px-4 py-3.5" onClick={e => e.stopPropagation()}>
-                        <input type="checkbox" checked={checked}
+                        <input type="checkbox" checked={checked} aria-label={`Select ${s.name}`}
                           onChange={e => setSelectedIds(prev => {
                             const next = new Set(prev)
                             e.target.checked ? next.add(s.id) : next.delete(s.id)
@@ -434,15 +521,14 @@ export default function AdminStudentsPanel({
                       </td>
                       <td className="px-4 py-3.5">
                         <div className="flex items-center gap-2.5">
-                          {s.profile_photo_url ? (
-                            <img src={s.profile_photo_url} alt={s.name}
-                              className="w-8 h-8 rounded-full object-cover shrink-0 border border-border" />
-                          ) : (
-                            <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
-                              style={{ background: "linear-gradient(135deg,#534AB7,#9D59C7)" }}>
-                              {initials}
-                            </div>
-                          )}
+                          <UserPhoto path={s.photo_url}
+                            className="w-8 h-8 rounded-full object-cover shrink-0 border border-border"
+                            fallback={
+                              <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                                style={{ background: "linear-gradient(135deg,#534AB7,#9D59C7)" }}>
+                                {initials}
+                              </div>
+                            } />
                           <div className="min-w-0">
                             <p className="font-semibold text-foreground text-sm truncate">{s.name}</p>
                             <div className="flex items-center gap-2 mt-0.5">
@@ -512,13 +598,14 @@ export default function AdminStudentsPanel({
                                     <span className="text-[10px] uppercase tracking-wider font-semibold">Attendance</span>
                                   </div>
                                   <p className="text-sm font-semibold text-foreground">
-                                    {detail.attendance_rate !== null ? `${detail.attendance_rate}%` : "No data"}
+                                    {detail.attendance_rate !== null ? `${detail.attendance_rate}%` : attendanceNoDataText}
                                   </p>
                                   {detail.attendance_breakdown.total > 0 && (
                                     <p className="text-[10px] text-muted-foreground">
                                       P:{detail.attendance_breakdown.present} L:{detail.attendance_breakdown.late} A:{detail.attendance_breakdown.absent}
                                     </p>
                                   )}
+                                  {attendanceBasisLine && <p className="text-[10px] text-muted-foreground">{attendanceBasisLine}</p>}
                                 </div>
                                 <div className="rounded-lg border border-border bg-card px-3 py-2">
                                   <div className="flex items-center gap-1.5 text-muted-foreground mb-1">
@@ -553,6 +640,7 @@ export default function AdminStudentsPanel({
                                   )}
                                 </div>
                               </div>
+                              <ClassHistorySection history={detail.class_history} onRetry={() => retryStudentDetail(s.id)} />
                               {/* Attendance panel */}
                               <div className="rounded-xl border border-border bg-muted/20 overflow-hidden">
                                 <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border bg-card">
@@ -676,7 +764,10 @@ export default function AdminStudentsPanel({
                               </div>
                             </div>
                           ) : (
-                            <p className="text-xs text-muted-foreground/60">Could not load details.</p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="text-xs text-muted-foreground/60">Could not load details.</p>
+                              <Button type="button" variant="outline" size="sm" className="h-7 text-xs rounded-lg" onClick={() => retryStudentDetail(s.id)}>Try again</Button>
+                            </div>
                           )}
                           <ParentsSection studentId={s.id} studentName={s.name} />
                         </td>
@@ -688,6 +779,8 @@ export default function AdminStudentsPanel({
             </tbody>
           </table>
         </div>
+        <ListPager {...studentPager} noun="students" anchorId="students-table" />
+        </>
       )}
 
       {/* Add student modal */}

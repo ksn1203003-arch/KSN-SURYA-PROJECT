@@ -396,21 +396,49 @@ function WeekBoard({ slots, rows, visible, todayCol, nowRow, getColor }: {
   nowRow: number
   getColor: (s: string) => ColorSet
 }) {
-  const boardRef    = useRef<HTMLDivElement>(null)
-  const todayHdrRef = useRef<HTMLDivElement>(null)
-  const [band, setBand] = useState({ left: 0, width: 0, show: false })
+  const boardRef       = useRef<HTMLDivElement>(null)
+  const todayHdrRef    = useRef<HTMLDivElement>(null)
+  const todayLastCellRef = useRef<HTMLDivElement>(null)
+  const [band, setBand] = useState({ left: 0, width: 0, top: 0, bottom: 8, show: false })
 
   useEffect(() => {
     function calc() {
       if (!boardRef.current || !todayHdrRef.current || todayCol < 0) { setBand(b => ({ ...b, show: false })); return }
       const br = boardRef.current.getBoundingClientRect()
       const hr = todayHdrRef.current.getBoundingClientRect()
-      const p  = 3
-      setBand({ left: hr.left - br.left - p, width: hr.width + p * 2, show: true })
+      const p  = 9
+      const headerGap = 6
+      // top is measured from the real bottom edge of the day-header (where
+      // "TUE" / "TODAY" live), not a flat guess from the grid's absolute top —
+      // a fixed offset was cutting into the header text because the header's
+      // real rendered height is taller than the guessed gap.
+      const top = hr.bottom - br.top + headerGap
+      // bottom is likewise measured from the real bottom edge of today's last
+      // period cell, not a flat guess from the grid's absolute bottom — same
+      // bug as top, just at the other end (was cutting into the last card).
+      const lastCellGap = 6
+      const bottom = todayLastCellRef.current
+        ? br.bottom - todayLastCellRef.current.getBoundingClientRect().bottom + lastCellGap
+        : 8
+      setBand({ left: hr.left - br.left - p, width: hr.width + p * 2, top, bottom, show: true })
     }
     calc(); setTimeout(calc, 50)
     window.addEventListener("resize", calc)
-    return () => window.removeEventListener("resize", calc)
+
+    // Recalculate whenever the grid's own box actually changes size/position —
+    // covers the mobile breakpoint where the sidebar moves above the grid
+    // (reflowing it) after this effect's initial measurement already ran,
+    // which window resize/the one-time timer alone can miss.
+    const ro = new ResizeObserver(calc)
+    if (boardRef.current) ro.observe(boardRef.current)
+    const scrollParent = boardRef.current?.parentElement
+    scrollParent?.addEventListener("scroll", calc)
+
+    return () => {
+      window.removeEventListener("resize", calc)
+      ro.disconnect()
+      scrollParent?.removeEventListener("scroll", calc)
+    }
   }, [todayCol])
 
   const getSlot = (day: string, period: number) => slots.find(s => s.day === day && s.period === period)
@@ -418,14 +446,14 @@ function WeekBoard({ slots, rows, visible, todayCol, nowRow, getColor }: {
 
   return (
     <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: "16px", padding: "14px", overflowX: "auto", boxShadow: CARD_SHADOW }}>
-      <div ref={boardRef} style={{ position: "relative", minWidth: "860px", display: "grid", gridTemplateColumns: "92px repeat(6, 1fr)", gap: "8px" }}>
+      <div ref={boardRef} style={{ position: "relative", minWidth: "860px", display: "grid", gridTemplateColumns: "92px repeat(6, 1fr)", gap: "14px" }}>
 
         {/* Today band */}
         {band.show && (
           <div style={{
-            position: "absolute", borderRadius: "12px", zIndex: 0, pointerEvents: "none", top: 0, bottom: 2,
+            position: "absolute", borderRadius: "12px", zIndex: 0, pointerEvents: "none", top: `${band.top}px`, bottom: `${band.bottom}px`,
             left: `${band.left}px`, width: `${band.width}px`,
-            background: "rgba(83,74,183,0.06)", border: "1px solid rgba(83,74,183,0.18)",
+            background: "var(--ts-today-bg)", border: "1px solid var(--ts-today-border)",
             transition: "left .3s, width .3s",
           }} />
         )}
@@ -474,10 +502,11 @@ function WeekBoard({ slots, rows, visible, todayCol, nowRow, getColor }: {
 
                 return (
                   <div key={`${day}-${r}`} className="ttdv-cell"
+                    ref={ci === todayCol && r === rows.length - 1 ? todayLastCellRef : undefined}
                     style={{
                       position: "relative", zIndex: 1,
                       border: `1px solid ${isNow && color ? color.base : T.border}`,
-                      borderRadius: "11px", padding: "14px 11px 14px 14px", minHeight: "76px",
+                      borderRadius: "9px", padding: "7px 7px 7px 9px", minHeight: "54px",
                       display: "flex", flexDirection: "column", justifyContent: "center", gap: "3px",
                       background: isNow && color ? color.bg : "transparent",
                       boxShadow: isNow && color ? `inset 0 0 0 2px ${color.base}` : undefined,

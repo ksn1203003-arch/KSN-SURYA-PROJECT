@@ -8,6 +8,8 @@ import { Module } from "../models/Module.js"
 import { ExamDefinition } from "../models/ExamDefinition.js"
 import { ExamResult } from "../models/ExamResult.js"
 import { Certificate } from "../models/Certificate.js"
+import { attendanceDateFilter, calculateAttendanceRate, countedFields, loadCountedClass } from "../lib/attendanceHelpers.js"
+import { todayIST } from "../lib/dateHelpers.js"
 
 const router = Router()
 router.use(requireAuth)
@@ -61,15 +63,38 @@ router.get("/child/attendance", async (req: AuthRequest, res: Response) => {
   const parent = await User.findById(req.userId).select("school_id linked_student_id").lean()
   if (!parent?.linked_student_id) return void res.status(404).json({ error: "No linked student" })
 
+  // Nothing is counted unless the child is an active student of the parent's own school and the
+  // child's class can be found inside that same school (empty figures, never "all sheets").
+  const emptyAnswer = {
+    records: [], total: 0, present: 0, late: 0, absent: 0, rate: null, recorded: false,
+    ...countedFields(null),
+  }
+
   const db = mongoose.connection.db
-  if (!db) return void res.json({ records: [] })
+  if (!db) return void res.json(emptyAnswer)
+
+  const child = await User.findOne({
+    _id:       parent.linked_student_id,
+    school_id: parent.school_id,
+    role:      "student",
+    is_active: true,
+  }).select("class_id school_id").lean()
+  if (!child?.class_id) return void res.json(emptyAnswer)
+
+  const counted = await loadCountedClass(child.class_id, parent.school_id)
+  if (!counted) return void res.json(emptyAnswer)
+  // A start date that is still ahead counts nothing yet
+  if (counted.start && counted.start > todayIST()) {
+    return void res.json({ ...emptyAnswer, ...countedFields(counted) })
+  }
 
   const studentOid = new mongoose.Types.ObjectId(parent.linked_student_id.toString())
 
-  // Aggregate at DB level — avoids loading the entire school's attendance collection into
-  // Node.js memory. Uses the compound index on {school_id, date} + records.student_id filter.
+  // Aggregate at DB level — avoids loading the class's attendance into Node.js memory.
+  // Matched by the child's current class (verified inside the school above) and the class's start
+  // date, which the {class_id, date} index serves; only the child's own marks are read.
   const agg = await db.collection("attendances").aggregate([
-    { $match: { school_id: parent.school_id, "records.student_id": studentOid } },
+    { $match: { class_id: child.class_id, "records.student_id": studentOid, ...attendanceDateFilter(counted.start) } },
     { $unwind: "$records" },
     { $match: { "records.student_id": studentOid } },
     { $project: { _id: 0, date: 1, period: 1, status: "$records.status" } },
@@ -79,9 +104,12 @@ router.get("/child/attendance", async (req: AuthRequest, res: Response) => {
   const total   = records.length
   const present = records.filter(r => r.status === "present").length
   const late    = records.filter(r => r.status === "late").length
-  const rate    = total > 0 ? Math.round(((present + late * 0.5) / total) * 100) : null
+  const rate    = calculateAttendanceRate(present, late, total)
 
-  res.json({ records, total, present, late, absent: total - present - late, rate })
+  res.json({
+    records, total, present, late, absent: total - present - late, rate, recorded: total > 0,
+    ...countedFields(counted),
+  })
 })
 
 // ── GET /api/parent/child/progress ───────────────────────────────────────────
